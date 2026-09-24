@@ -3,8 +3,9 @@ from datetime import date, datetime, timedelta
 from functools import wraps
 from io import BytesIO
 import os
+import math
 from uuid import uuid4
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -21,7 +22,7 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(__file__), "uploads", "assignments")
 CORS(app)
 serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
-ALLOWED_ASSIGNMENT_EXTENSIONS = {"pdf", "doc", "docx", "txt", "ppt", "pptx"}
+ALLOWED_ASSIGNMENT_EXTENSIONS = {"pdf", "doc", "docx", "txt", "ppt", "pptx", "jpg", "jpeg", "png"}
 
 def public(doc):
     if not doc: return doc
@@ -31,13 +32,67 @@ def public(doc):
 def error(message, status=400): return jsonify({"error": message}), status
 def identity():
     auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "): return None
+    token_str = None
+    if auth.startswith("Bearer "):
+        token_str = auth[7:]
+    elif request.args.get("token"):
+        token_str = request.args.get("token")
+    if not token_str: return None
     try:
-        token = serializer.loads(auth[7:], max_age=28800)
+        token = serializer.loads(token_str, max_age=28800)
         user = database.users.find_one({"username": token.get("username")})
         if not user or user.get("status") != "active" or user.get("token_version", 0) != token.get("token_version", 0): return None
         return token
     except (BadSignature, SignatureExpired): return None
+
+@app.get("/api/assignments/files/<path:filename>")
+def download_assignment_file(filename):
+    user = identity()
+    if not user:
+        return error("Authentication required to access files", 401)
+    
+    file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+    if not os.path.exists(file_path):
+        return error("File not found", 404)
+        
+    as_attachment = request.args.get("download") == "1"
+
+    role = user.get("role")
+    username = user.get("username")
+    student_id = user.get("student_id")
+    teacher_id = user.get("teacher_id")
+
+    # 1. Check reference file authorization
+    assignment = database.assignments.find_one({"ref_file_name": filename})
+    if assignment:
+        course_id = assignment["course_id"]
+        if role == "admin": authorized = True
+        elif role == "teacher":
+            authorized = bool(database.course_assignments.find_one({"course_id": course_id, "teacher_id": teacher_id, "status": "active"}))
+        elif role == "student":
+            authorized = bool(database.enrollments.find_one({"course_id": course_id, "student_id": student_id}) or database.enrollments.find_one({"course_id": course_id, "roll": username}))
+        else: authorized = False
+        if not authorized: return error("Unauthorized to access this reference file", 403)
+        return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=as_attachment)
+
+    # 2. Check student submission file authorization
+    submission = database.assignment_submissions.find_one({"file_name": filename})
+    if submission:
+        course_id = submission["course_id"]
+        if role == "admin": authorized = True
+        elif role == "teacher":
+            authorized = bool(database.course_assignments.find_one({"course_id": course_id, "teacher_id": teacher_id, "status": "active"}))
+        elif role == "student":
+            authorized = (submission.get("student_id") == student_id or submission.get("roll") == username or submission.get("student_id") == username)
+        else: authorized = False
+        if not authorized: return error("Unauthorized to access this submission file", 403)
+        return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=as_attachment)
+
+    if role in ("admin", "teacher", "student"):
+        return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=as_attachment)
+
+    return error("File metadata not found", 404)
+
 def require_role(required_role):
     """Authorize only the role encoded in the signed login token."""
     def decorator(fn):
@@ -107,8 +162,20 @@ def test_summary(course):
     rows = []
     for student in students_for(course):
         tests = [values.get((student["roll"], number)) for number in range(1, 5)]
-        seen = [mark for mark in tests if isinstance(mark, (int, float))]
-        rows.append({**student, "ct1": tests[0], "ct2": tests[1], "ct3": tests[2], "ct4": tests[3], "best_3_average": round(sum(sorted(seen, reverse=True)[:3]) / 3, 2) if len(seen) >= 3 else None})
+        recorded = []
+        for mark in tests:
+            if mark is None: continue
+            if isinstance(mark, str) and mark.strip().upper() == 'A':
+                recorded.append(0)
+            elif isinstance(mark, (int, float)):
+                recorded.append(mark)
+        if recorded:
+            top3 = sorted(recorded, reverse=True)[:3]
+            denom = 3 if len(recorded) >= 3 else len(recorded)
+            avg = math.ceil(sum(top3) / denom)
+        else:
+            avg = None
+        rows.append({**student, "ct1": tests[0], "ct2": tests[1], "ct3": tests[2], "ct4": tests[3], "best_3_average": avg})
     return rows
 
 def current_student():
@@ -138,8 +205,19 @@ def student_course_summary(student, course):
     records = {(row.get("week"), row.get("day")): row for row in database.attendance.find({"course_id": course["course_id"], "student_id": student["student_id"]})}
     present = sum(records.get((row.get("week"), row.get("day")), {}).get("status") == "Present" for row in held)
     total = len(held); percentage = round(present * 100 / total, 2) if total else 0
-    marks = [row.get("obtained_marks") for row in database.class_test_results.find({"course_id": course["course_id"], "student_id": student["student_id"]}) if isinstance(row.get("obtained_marks"), (int, float))]
-    best_three = round(sum(sorted(marks, reverse=True)[:3]) / 3, 2) if len(marks) >= 3 else None
+    stored_tests = list(database.class_test_results.find({"course_id": course["course_id"], "student_id": student["student_id"]}))
+    test_marks = []
+    for row in stored_tests:
+        m = row.get("obtained_marks")
+        if m is None: continue
+        if isinstance(m, str) and m.strip().upper() == 'A': test_marks.append(0)
+        elif isinstance(m, (int, float)): test_marks.append(m)
+    if test_marks:
+        top3 = sorted(test_marks, reverse=True)[:3]
+        denom = 3 if len(test_marks) >= 3 else len(test_marks)
+        best_three = math.ceil(sum(top3) / denom)
+    else:
+        best_three = None
     assignment_count = len(list(database.assignments.find({"course_id": course["course_id"]})))
     submitted = len(list(database.assignment_submissions.find({"course_id": course["course_id"], "student_id": student["student_id"]})))
     return {"attendance": {"total_classes_held": total, "present": present, "absent": total - present, "percentage": percentage, "status": "Good" if percentage >= 80 else "Warning" if percentage >= 70 else "Critical"}, "class_tests": {"best_3_average": best_three, "total_marks": 20}, "assignments": {"submitted": submitted, "total": assignment_count}}
@@ -241,10 +319,20 @@ def student_assignments(course_code):
     result = []
     for assignment in sorted(database.assignments.find({"course_id": course["course_id"]}), key=lambda row: row.get("assignment_number", 0)):
         submission = database.assignment_submissions.find_one({"assignment_id": assignment["assignment_id"], "student_id": student["student_id"]})
+        if not submission:
+            submission = database.assignment_submissions.find_one({"assignment_id": assignment["assignment_id"], "roll": student.get("roll")})
         item = public(assignment)
         if submission:
-            item.update({"submission_status": "Graded" if submission.get("marks") is not None else submission.get("status", "Submitted").title(), "submitted_at": submission.get("submitted_at"), "marks": submission.get("marks"), "file_name": submission.get("file_name")})
-        else: item["submission_status"] = "Not Submitted"
+            item.update({
+                "submission_status": "Graded" if submission.get("marks") is not None else submission.get("status", "Submitted").title(),
+                "submitted_at": submission.get("submitted_at"),
+                "text_answer": submission.get("text_answer"),
+                "file_name": submission.get("file_name"),
+                "marks": submission.get("marks"),
+                "feedback": submission.get("feedback")
+            })
+        else:
+            item["submission_status"] = "Not Submitted"
         result.append(item)
     return jsonify({"assignments": result})
 
@@ -259,21 +347,61 @@ def submit_student_assignment(course_code, assignment_id):
     except (TypeError, ValueError): return error("Assignment has an invalid deadline", 400)
     if date.today() > deadline: return error("Assignment submission deadline has passed.", 400)
     text_answer = request.form.get("text_answer", "").strip() if request.form else (request.get_json(silent=True) or {}).get("text_answer", "").strip()
-    upload = request.files.get("file")
+    upload = request.files.get("file") or request.files.get("submission_file")
     file_name = None
+    file_path = None
     if upload and upload.filename:
         extension = upload.filename.rsplit(".", 1)[-1].lower() if "." in upload.filename else ""
-        if extension not in ALLOWED_ASSIGNMENT_EXTENSIONS: return error("Unsupported file type. Upload PDF, DOC, DOCX, TXT, PPT, or PPTX.")
-        file_name = secure_filename(upload.filename)
+        if extension not in ALLOWED_ASSIGNMENT_EXTENSIONS:
+            return error(f"Unsupported file type. Allowed: {', '.join(sorted(ALLOWED_ASSIGNMENT_EXTENSIONS))}")
+        upload.seek(0, os.SEEK_END)
+        size = upload.tell()
+        upload.seek(0)
+        if size > 10 * 1024 * 1024:
+            return error("File size exceeds 10 MB limit.", 400)
+        s_name = secure_filename(upload.filename)
+        stored_name = f"sub_{uuid4()}_{s_name}"
         os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-        stored_name = f"{uuid4()}_{file_name}"
-        upload.save(os.path.join(app.config["UPLOAD_FOLDER"], stored_name))
+        full_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
+        upload.save(full_path)
         file_name = stored_name
-    if not text_answer and not file_name: return error("Provide a text answer or an allowed assignment file.")
+        file_path = full_path
+
     existing = database.assignment_submissions.find_one({"assignment_id": assignment_id, "student_id": student["student_id"]})
-    row = {"assignment_id": assignment_id, "course_id": course["course_id"], "course_code": course["course_code"], "student_id": student["student_id"], "roll": student.get("roll", student["student_id"]), "submitted_at": datetime.utcnow().isoformat(), "text_answer": text_answer, "file_name": file_name or (existing or {}).get("file_name"), "file_path": os.path.join(app.config["UPLOAD_FOLDER"], file_name) if file_name else (existing or {}).get("file_path"), "status": "Submitted", "marks": existing.get("marks") if existing else None, "total_marks": assignment["total_marks"], "feedback": existing.get("feedback") if existing else None}
+    if not file_name and not (existing or {}).get("file_name"):
+        return error("Please select an assignment file to upload.", 400)
+    row = {
+        "assignment_id": assignment_id,
+        "course_id": course["course_id"],
+        "course_code": course["course_code"],
+        "student_id": student["student_id"],
+        "roll": student.get("roll", student["student_id"]),
+        "submitted_at": datetime.utcnow().isoformat(),
+        "text_answer": "",
+        "file_name": file_name or (existing or {}).get("file_name"),
+        "file_path": file_path or (existing or {}).get("file_path"),
+        "status": "Submitted",
+        "marks": existing.get("marks") if existing else None,
+        "total_marks": assignment["total_marks"],
+        "feedback": existing.get("feedback") if existing else None
+    }
     database.assignment_submissions.update_one({"assignment_id": assignment_id, "student_id": student["student_id"]}, {"$set": row}, upsert=True)
     return jsonify({"message": "Assignment submitted successfully.", "status": row["status"]})
+
+
+@app.route("/api/student/courses/<path:course_code>/assignments/<assignment_id>/unsubmit", methods=["POST", "DELETE"])
+@require_student
+def unsubmit_student_assignment(course_code, assignment_id):
+    student, course, response = student_course(course_code)
+    if response: return response
+    existing = database.assignment_submissions.find_one({"assignment_id": assignment_id, "student_id": student["student_id"]})
+    if not existing: return error("Submission not found", 404)
+    file_path = existing.get("file_path")
+    if file_path and os.path.exists(file_path):
+        try: os.remove(file_path)
+        except OSError: pass
+    database.assignment_submissions.delete_one({"assignment_id": assignment_id, "student_id": student["student_id"]})
+    return jsonify({"message": "Assignment submission removed successfully."})
 
 @app.get("/api/admin/dashboard")
 @require_admin
@@ -552,52 +680,285 @@ def class_tests(course_code):
     if response: return response
     if request.method == "GET": return jsonify({"total_marks": 20, "students": test_summary(course)})
     payload = request.get_json(silent=True) or {}; results, total = payload.get("results"), payload.get("total_marks", 20)
-    if not isinstance(total, (int, float)) or total <= 0 or not isinstance(results, list): return error("Provide results and positive total_marks")
-    enrolled = {row["roll"] for row in students_for(course)}
+    if not isinstance(results, list): return error("Provide results list")
+    enrolled_rolls = {str(row["roll"]) for row in students_for(course)}
+    saved_count = 0
     for item in results:
-        roll, number, mark = item.get("roll"), item.get("test_number"), item.get("obtained_marks")
-        if roll not in enrolled or number not in (1,2,3,4) or not isinstance(mark, (int,float)) or not 0 <= mark <= total: return error("Invalid class-test result")
-        row = {"student_id": roll, "roll": roll, "course_id": course["course_id"], "course_code": course["course_code"], "series": course["series"], "semester": course["semester"], "test_number": number, "obtained_marks": mark, "total_marks": total}
-        database.class_test_results.update_one({"course_id": course["course_id"], "roll": roll, "test_number": number}, {"$set": row}, upsert=True)
-    return jsonify({"saved": len(results)})
+        if not isinstance(item, dict): continue
+        roll = str(item.get("roll", "")).strip()
+        if not roll or roll not in enrolled_rolls: continue
+        try:
+            number = int(item.get("test_number"))
+            if number not in (1, 2, 3, 4): continue
+        except (ValueError, TypeError): continue
+        mark = item.get("obtained_marks")
+        if mark is None: continue
+        mark_val = None
+        if isinstance(mark, str):
+            s_mark = mark.strip().upper()
+            if s_mark == 'A':
+                mark_val = 'A'
+            elif s_mark != '':
+                try:
+                    num = float(s_mark)
+                    if 0 <= num <= total:
+                        mark_val = int(num) if num.is_integer() else num
+                except ValueError: pass
+        elif isinstance(mark, (int, float)) and not isinstance(mark, bool):
+            if 0 <= mark <= total:
+                mark_val = int(mark) if float(mark).is_integer() else float(mark)
+        if mark_val is not None:
+            row = {"student_id": roll, "roll": roll, "course_id": course["course_id"], "course_code": course["course_code"], "series": course["series"], "semester": course["semester"], "test_number": number, "obtained_marks": mark_val, "total_marks": total}
+            database.class_test_results.update_one({"course_id": course["course_id"], "roll": roll, "test_number": number}, {"$set": row}, upsert=True)
+            saved_count += 1
+    return jsonify({"saved": saved_count})
 
 @app.route("/api/teacher/courses/<path:course_code>/assignments", methods=["GET", "POST"])
 @require_teacher
 def assignments(course_code):
     course, response = owned_course(course_code)
     if response: return response
-    if request.method == "GET": return jsonify({"assignments": [public(row) for row in database.assignments.find({"course_id": course["course_id"]})], "submissions": [public(row) for row in database.assignment_submissions.find({"course_id": course["course_id"]})]})
-    payload = request.get_json(silent=True) or {}
-    if not payload.get("title") or not payload.get("deadline") or not isinstance(payload.get("total_marks"), (int,float)): return error("title, deadline, total_marks are required")
-    number = len(list(database.assignments.find({"course_id": course["course_id"]}))) + 1
-    if number > 3: return error("Each course can have exactly 3 assignments", 409)
-    row = {"assignment_id": f"{course['course_id']}-A{number}", "course_id": course["course_id"], "course_code": course["course_code"], "teacher_id": request.teacher_id, "series": course["series"], "semester": course["semester"], "assignment_number": number, "title": payload["title"], "deadline": payload["deadline"], "total_marks": payload["total_marks"], "status": "active"}
-    database.assignments.insert_one(row); return jsonify({"assignment": row}), 201
+    
+    if request.method == "GET":
+        course_assignments = sorted([public(row) for row in database.assignments.find({"course_id": course["course_id"]})], key=lambda row: row.get("assignment_number", 0))
+        enrolled_students = students_for(course)
+        
+        assign_ids = [assign["assignment_id"] for assign in course_assignments]
+        raw_submissions = list(database.assignment_submissions.find({"assignment_id": {"$in": assign_ids}}))
+        
+        subs_map = {}
+        for sub in raw_submissions:
+            aid = sub.get("assignment_id")
+            r = sub.get("roll")
+            sid = sub.get("student_id")
+            if r is not None:
+                subs_map[(aid, str(r))] = sub
+            if sid is not None:
+                subs_map[(aid, str(sid))] = sub
+
+        assignments_data = []
+        for assign in course_assignments:
+            assign_id = assign["assignment_id"]
+            total_m = assign.get("total_marks", 10)
+            student_submissions = []
+            for student in enrolled_students:
+                roll = student["roll"]
+                sid = student.get("student_id", roll)
+                sub = subs_map.get((assign_id, str(roll))) or subs_map.get((assign_id, str(sid)))
+                
+                if sub and (sub.get("file_name") or sub.get("status") in ("Submitted", "Graded") or sub.get("text_answer")):
+                    status = "Submitted"
+                else:
+                    status = "Not Submitted"
+                
+                student_submissions.append({
+                    "roll": roll,
+                    "name": student.get("name", roll),
+                    "student_id": sid,
+                    "status": status,
+                    "submitted_at": sub.get("submitted_at") if sub else None,
+                    "text_answer": sub.get("text_answer") if sub else None,
+                    "file_name": sub.get("file_name") if sub else None,
+                    "marks": sub.get("marks") if sub else None,
+                    "total_marks": total_m,
+                    "feedback": sub.get("feedback") if sub else None
+                })
+            assignments_data.append({
+                **assign,
+                "submissions": student_submissions
+            })
+            
+        return jsonify({
+            "assignments": assignments_data,
+            "enrolled_students": enrolled_students
+        })
+
+    # POST - Create or update assignment
+    if request.form:
+        title = request.form.get("title", "").strip()
+        description = request.form.get("description", "").strip()
+        deadline = request.form.get("deadline", "").strip()
+        total_marks_raw = request.form.get("total_marks", "10")
+        assign_num_raw = request.form.get("assignment_number")
+    else:
+        payload = request.get_json(silent=True) or {}
+        title = payload.get("title", "").strip()
+        description = payload.get("description", "").strip()
+        deadline = payload.get("deadline", "").strip()
+        total_marks_raw = payload.get("total_marks", 10)
+        assign_num_raw = payload.get("assignment_number")
+
+    try:
+        total_marks = float(total_marks_raw)
+    except (ValueError, TypeError):
+        return error("Total marks must be a valid number", 400)
+
+    if not title or not deadline:
+        return error("Title and deadline are required", 400)
+
+    existing_assignments = list(database.assignments.find({"course_id": course["course_id"]}))
+    
+    if assign_num_raw:
+        try:
+            number = int(assign_num_raw)
+            if number not in (1, 2, 3):
+                return error("Assignment number must be 1, 2, or 3", 400)
+        except ValueError:
+            return error("Assignment number must be 1, 2, or 3", 400)
+    else:
+        existing_numbers = {a.get("assignment_number") for a in existing_assignments}
+        available = [n for n in (1, 2, 3) if n not in existing_numbers]
+        if not available:
+            return error("Each course can have exactly 3 assignments", 409)
+        number = available[0]
+
+    # Handle Reference / Instructions File Upload
+    ref_upload = request.files.get("ref_file") or request.files.get("file")
+    ref_file_name = None
+    ref_file_path = None
+    if ref_upload and ref_upload.filename:
+        ext = ref_upload.filename.rsplit(".", 1)[-1].lower() if "." in ref_upload.filename else ""
+        if ext not in ALLOWED_ASSIGNMENT_EXTENSIONS:
+            return error(f"Unsupported reference file type. Allowed: {', '.join(sorted(ALLOWED_ASSIGNMENT_EXTENSIONS))}")
+        
+        ref_upload.seek(0, os.SEEK_END)
+        size = ref_upload.tell()
+        ref_upload.seek(0)
+        if size > 10 * 1024 * 1024:
+            return error("Reference file exceeds maximum size of 10 MB", 400)
+
+        s_name = secure_filename(ref_upload.filename)
+        stored_name = f"ref_{uuid4()}_{s_name}"
+        os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+        full_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
+        ref_upload.save(full_path)
+        ref_file_name = stored_name
+        ref_file_path = full_path
+
+    assignment_id = f"{course['course_id']}-A{number}"
+    existing_doc = database.assignments.find_one({"assignment_id": assignment_id}) or {}
+
+    doc = {
+        "assignment_id": assignment_id,
+        "course_id": course["course_id"],
+        "course_code": course["course_code"],
+        "teacher_id": request.teacher_id,
+        "series": course["series"],
+        "semester": course["semester"],
+        "assignment_number": number,
+        "title": title,
+        "description": description,
+        "deadline": deadline,
+        "total_marks": total_marks,
+        "ref_file_name": ref_file_name or existing_doc.get("ref_file_name"),
+        "ref_file_path": ref_file_path or existing_doc.get("ref_file_path"),
+        "status": "active"
+    }
+
+    database.assignments.update_one({"assignment_id": assignment_id}, {"$set": doc}, upsert=True)
+    return jsonify({"message": "Assignment created/updated successfully.", "assignment": public(doc)}), 201
 
 @app.post("/api/teacher/courses/<path:course_code>/assignments/<assignment_id>/submissions/<roll>/grade")
 @require_teacher
 def grade_assignment(course_code, assignment_id, roll):
     course, response = owned_course(course_code)
     if response: return response
-    payload = request.get_json(silent=True) or {}; submission = database.assignment_submissions.find_one({"assignment_id": assignment_id, "course_id": course["course_id"], "roll": roll})
-    if not submission: return error("Submission not found", 404)
-    assignment = database.assignments.find_one({"assignment_id": assignment_id})
-    marks = payload.get("marks")
-    if not isinstance(marks, (int, float)) or not 0 <= marks <= assignment["total_marks"]: return error("Marks must be within the assignment total")
-    database.assignment_submissions.update_one({"assignment_id": assignment_id, "course_id": course["course_id"], "roll": roll}, {"$set": {"marks": marks, "total_marks": assignment["total_marks"], "graded_by": request.teacher_id}}, upsert=False)
-    return jsonify({"status": "graded", "marks": marks})
+    
+    assignment = database.assignments.find_one({"assignment_id": assignment_id, "course_id": course["course_id"]})
+    if not assignment:
+        return error("Assignment not found for this course", 404)
+
+    payload = request.get_json(silent=True) or {}
+    marks_raw = payload.get("marks")
+    feedback = payload.get("feedback", "").strip()
+
+    try:
+        marks = float(marks_raw)
+    except (ValueError, TypeError):
+        return error("Marks must be a valid number", 400)
+
+    total_marks = float(assignment.get("total_marks", 10))
+    if marks < 0 or marks > total_marks:
+        return error(f"Marks must be between 0 and {total_marks}", 400)
+
+    submission = database.assignment_submissions.find_one({"assignment_id": assignment_id, "course_id": course["course_id"], "roll": roll})
+    if not submission:
+        student_doc = database.students.find_one({"roll": roll})
+        if not student_doc:
+            return error("Student not found", 404)
+        submission = {
+            "assignment_id": assignment_id,
+            "course_id": course["course_id"],
+            "course_code": course["course_code"],
+            "student_id": student_doc.get("student_id", roll),
+            "roll": roll,
+            "submitted_at": datetime.utcnow().isoformat(),
+            "text_answer": "",
+            "file_name": None,
+            "file_path": None,
+            "status": "Submitted"
+        }
+
+    update_doc = {
+        "marks": marks,
+        "total_marks": total_marks,
+        "feedback": feedback,
+        "status": "Graded",
+        "graded_by": request.teacher_id,
+        "graded_at": datetime.utcnow().isoformat()
+    }
+    
+    database.assignment_submissions.update_one(
+        {"assignment_id": assignment_id, "course_id": course["course_id"], "roll": roll},
+        {"$set": {**submission, **update_doc}},
+        upsert=True
+    )
+    return jsonify({"message": "Marks saved successfully.", "status": "Graded", "marks": marks, "feedback": feedback})
+
 
 @app.get("/api/teacher/courses/<path:course_code>/performance")
 @require_teacher
 def performance(course_code):
     course, response = owned_course(course_code)
     if response: return response
-    tests = {row["roll"]: row for row in test_summary(course)}; results = []
-    for att in attendance_summary(course):
-        ct = tests[att["roll"]]["best_3_average"] or 0
-        scores = [row.get("marks", 0) / row.get("total_marks", 1) * 20 for row in database.assignment_submissions.find({"course_id": course["course_id"], "roll": att["roll"]}) if row.get("total_marks")]
-        assignment = round(sum(scores)/len(scores), 2) if scores else 0; overall = round(att["attendance_percentage"]*.5 + ct/20*35 + assignment/20*15, 2)
-        results.append({"roll": att["roll"], "name": att["name"], "classes_held": att["total_held"], "present": att["present"], "absent": att["absent"], "attendance_percentage": att["attendance_percentage"], "ct_best_3_average": ct, "assignment_average": assignment, "overall_performance": overall, "risk_level": "Low" if overall >= 80 else "Medium" if overall >= 60 else "High"})
+    
+    all_submissions = list(database.assignment_submissions.find({"course_id": course["course_id"]}))
+    sub_scores_map = {}
+    for sub in all_submissions:
+        roll = sub.get("roll")
+        sid = sub.get("student_id")
+        total_m = sub.get("total_marks")
+        marks = sub.get("marks")
+        if total_m and marks is not None and isinstance(marks, (int, float)):
+            score = (float(marks) / float(total_m)) * 20.0
+            if roll is not None:
+                sub_scores_map.setdefault(str(roll), []).append(score)
+            if sid is not None and sid != roll:
+                sub_scores_map.setdefault(str(sid), []).append(score)
+
+    tests = {row["roll"]: row for row in test_summary(course)}
+    att_rows = attendance_summary(course)
+    results = []
+    
+    for att in att_rows:
+        roll = att["roll"]
+        ct = tests.get(roll, {}).get("best_3_average") or 0
+        scores = sub_scores_map.get(str(roll), [])
+        assignment = round(sum(scores) / len(scores), 2) if scores else 0
+        overall = round(att["attendance_percentage"] * 0.5 + (ct / 20.0) * 35.0 + (assignment / 20.0) * 15.0, 2)
+        
+        results.append({
+            "roll": roll,
+            "name": att["name"],
+            "classes_held": att["total_held"],
+            "present": att["present"],
+            "absent": att["absent"],
+            "attendance_percentage": att["attendance_percentage"],
+            "ct_best_3_average": ct,
+            "assignment_average": assignment,
+            "overall_performance": overall,
+            "risk_level": "Low" if overall >= 80 else "Medium" if overall >= 60 else "High"
+        })
     return jsonify({"students": results})
 
 @app.get("/api/teacher/courses/<path:course_code>/reports/<report_type>")
@@ -640,4 +1001,4 @@ def export_report(course_code, report_type):
 @app.get("/api/health")
 def health(): return jsonify({"status": "ok", "database": "in-memory development fallback" if database.using_in_memory_database else "mongodb"})
 
-if __name__ == "__main__": app.run(host="0.0.0.0", port=8000, debug=False)
+if __name__ == "__main__": app.run(host="0.0.0.0", port=8000, debug=True)
