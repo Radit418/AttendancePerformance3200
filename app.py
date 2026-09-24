@@ -998,6 +998,10 @@ def export_report(course_code, report_type):
         return app.response_class(stream.getvalue(), mimetype="application/pdf", headers={"Content-Disposition": f"attachment; filename={filename}.pdf"})
     return error("Use format=xlsx or format=pdf")
 
+@app.get("/")
+def index():
+    return jsonify({"status": "ok", "message": "Smart Attendance System API", "database": "in-memory development fallback" if database.using_in_memory_database else "mongodb"})
+
 @app.get("/api/health")
 def health(): return jsonify({"status": "ok", "database": "in-memory development fallback" if database.using_in_memory_database else "mongodb"})
 
