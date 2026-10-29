@@ -12,8 +12,10 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
 from openpyxl import Workbook
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import landscape, A3
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle
+from reportlab.lib.pagesizes import landscape, A3, A4
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, KeepTogether
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 import database
 
 app = Flask(__name__)
@@ -144,9 +146,20 @@ def slots(course):
     all_slots = []
     for week in range(1, 14):
         for day in range(1, 6):
-            default = {"course_id": course["course_id"], "course_code": course["course_code"], "series": course["series"], "semester": course["semester"], "week": week, "day": day, "date": (start + timedelta(days=(week - 1) * 7 + day - 1)).isoformat(), "class_held": False, "teacher_id": course["teacher_id"]}
+            default = {"course_id": course["course_id"], "course_code": course.get("course_code", ""), "series": course.get("series", 22), "semester": course.get("semester", 6), "week": week, "day": day, "date": (start + timedelta(days=(week - 1) * 7 + day - 1)).isoformat(), "class_held": False, "teacher_id": course.get("teacher_id", "")}
             all_slots.append(saved.get((week, day), default))
     return all_slots
+def get_attendance_marks(pct):
+    if pct is None: return 0
+    if pct >= 90: return 10
+    elif pct >= 85: return 9
+    elif pct >= 80: return 8
+    elif pct >= 75: return 7
+    elif pct >= 70: return 6
+    elif pct >= 65: return 5
+    elif pct >= 60: return 4
+    else: return 0
+
 def attendance_summary(course):
     held = {(row["week"], row["day"]): row for row in slots(course) if row.get("class_held")}
     stored = {(row["roll"], row["week"], row["day"]): row.get("status") for row in database.attendance.find({"course_id": course["course_id"]}) if "roll" in row and "week" in row and "day" in row}
@@ -154,8 +167,9 @@ def attendance_summary(course):
     for student in students_for(course):
         present = sum(stored.get((student["roll"], week, day)) == "Present" for week, day in held)
         total = len(held); pct = round(present * 100 / total, 2) if total else 0
+        att_marks = get_attendance_marks(pct)
         cells = {f"w{week}d{day}": stored.get((student["roll"], week, day), "") for week in range(1, 14) for day in range(1, 6)}
-        rows.append({**student, "attendance": cells, "total_held": total, "present": present, "absent": total-present, "attendance_percentage": pct, "attendance_status": "Good" if pct >= 80 else "Warning" if pct >= 70 else "Critical"})
+        rows.append({**student, "attendance": cells, "total_held": total, "present": present, "absent": total-present, "attendance_percentage": pct, "attendance_marks": att_marks, "attendance_status": "Good" if pct >= 80 else "Warning" if pct >= 70 else "Critical"})
     return rows
 def test_summary(course):
     values = {(row["roll"], row["test_number"]): row.get("obtained_marks") for row in database.class_test_results.find({"course_id": course["course_id"]}) if "roll" in row and "test_number" in row}
@@ -234,7 +248,11 @@ def login():
     if user.get("status") != "active":
         return error("Your account is inactive. Please contact the administrator.", 403)
     token_data = {"role": user["role"], "username": user["username"], "teacher_id": user.get("teacher_id"), "student_id": user.get("student_id"), "token_version": user.get("token_version", 0)}
-    if user["role"] == "teacher": profile = database.teachers.find_one({"teacher_id": user["teacher_id"]})
+    if user["role"] == "teacher":
+        t = database.teachers.find_one({"teacher_id": user["teacher_id"]})
+        profile = dict(t) if t else {}
+        if not profile.get("contact_no"):
+            profile["contact_no"] = profile.get("phone", f"+880 1711-0000{user['teacher_id'][-2:] if len(user['teacher_id'])>=2 else '01'}")
     elif user["role"] == "student": profile = database.students.find_one({"student_id": user["student_id"]})
     else: profile = {"username": "admin", "name": "System Administrator"}
     return jsonify({"token": serializer.dumps(token_data), "role": user["role"], "profile": public(profile), "dashboard_path": f"/{user['role']}/dashboard"})
@@ -408,9 +426,20 @@ def unsubmit_student_assignment(course_code, assignment_id):
 def admin_dashboard():
     current_series = database.series.find_one({"status": "active"}) or database.series.find_one({"series": 22})
     current_semester = database.semesters.find_one({"status": "current"}) or database.semesters.find_one({"semester": 6})
-    total_courses = len(list(database.courses.find({})))
-    assigned = len(list(database.course_assignments.find({"status": "active"})))
-    return jsonify({"students": len(list(database.students.find({}))), "teachers": len(list(database.teachers.find({}))), "series": len(list(database.series.find({}))), "semesters": len(list(database.semesters.find({}))), "courses": total_courses, "users": len(list(database.users.find({}))), "current_series": current_series.get("series") if current_series else None, "current_semester": current_semester.get("semester") if current_semester else None, "assigned_courses": assigned, "unassigned_courses": max(total_courses - assigned, 0)})
+    total_courses = database.courses.count_documents({})
+    assigned = database.course_assignments.count_documents({"status": "active"})
+    return jsonify({
+        "students": database.students.count_documents({}),
+        "teachers": database.teachers.count_documents({}),
+        "series": database.series.count_documents({}),
+        "semesters": database.semesters.count_documents({}),
+        "courses": total_courses,
+        "users": database.users.count_documents({}),
+        "current_series": current_series.get("series") if current_series else None,
+        "current_semester": current_semester.get("semester") if current_semester else None,
+        "assigned_courses": assigned,
+        "unassigned_courses": max(total_courses - assigned, 0)
+    })
 
 @app.get("/api/admin/students")
 @require_admin
@@ -419,11 +448,12 @@ def admin_students():
     if request.args.get("series"): query["series"] = int(request.args["series"])
     if request.args.get("semester"): query["semester"] = int(request.args["semester"])
     needle = request.args.get("search", "").lower()
+    users_map = {u["username"]: u.get("status", "active") for u in database.users.find({"role": "student"}, {"username": 1, "status": 1})}
     rows = []
     for s in database.students.find(query):
         row = public(s)
-        u = database.users.find_one({"username": s.get("roll") or s.get("student_id")})
-        if u and u.get("status"): row["status"] = u.get("status")
+        st = users_map.get(s.get("roll") or s.get("student_id"))
+        if st: row["status"] = st
         rows.append(row)
     if needle: rows = [row for row in rows if needle in str(row.get("roll", "")).lower() or needle in row.get("name", "").lower()]
     return jsonify({"students": sorted(rows, key=lambda row: row.get("roll", ""))})
@@ -431,32 +461,49 @@ def admin_students():
 @app.get("/api/admin/teachers")
 @require_admin
 def admin_teachers():
+    teacher_users = {u["username"]: u.get("status", "active") for u in database.users.find({"role": "teacher"}, {"username": 1, "status": 1})}
+    from collections import Counter
+    active_assignments = database.course_assignments.find({"status": "active"}, {"teacher_id": 1})
+    counts = Counter(a.get("teacher_id") for a in active_assignments)
     rows = []
     for teacher in database.teachers.find({}):
         item = public(teacher)
-        u = database.users.find_one({"username": teacher["teacher_id"]})
-        if u and u.get("status"): item["status"] = u.get("status")
-        item["assigned_courses"] = len(list(database.course_assignments.find({"teacher_id": teacher["teacher_id"], "status": "active"})))
+        tid = teacher.get("teacher_id")
+        st = teacher_users.get(tid)
+        if st: item["status"] = st
+        item["assigned_courses"] = counts.get(tid, 0)
         rows.append(item)
     return jsonify({"teachers": sorted(rows, key=lambda row: row.get("teacher_id", ""))})
 
 @app.get("/api/admin/teachers/<teacher_id>/courses")
 @require_admin
 def admin_teacher_courses(teacher_id):
+    assignments = list(database.course_assignments.find({"teacher_id": teacher_id, "status": "active"}))
+    course_ids = [a["course_id"] for a in assignments if a.get("course_id")]
+    courses_map = {c["course_id"]: c for c in database.courses.find({"course_id": {"$in": course_ids}})}
     result = []
-    for assignment in database.course_assignments.find({"teacher_id": teacher_id, "status": "active"}):
-        course = database.courses.find_one({"course_id": assignment["course_id"]}) or {}
+    for assignment in assignments:
+        course = courses_map.get(assignment.get("course_id"), {})
         result.append({**public(assignment), "course_name": course.get("course_name"), "course_type": course.get("course_type")})
     return jsonify({"courses": result})
 
 @app.get("/api/admin/series")
 @require_admin
 def admin_series():
+    all_students = list(database.students.find({}, {"series": 1, "current_semester": 1, "semester": 1}))
+    series_groups = {}
+    for s in all_students:
+        ser = s.get("series")
+        if ser not in series_groups: series_groups[ser] = []
+        series_groups[ser].append(s)
     rows = []
     for item in database.series.find({}):
-        row = public(item); members = list(database.students.find({"series": item["series"]})); count = len(members)
+        row = public(item); ser = item.get("series")
+        members = series_groups.get(ser, [])
+        count = len(members)
         current_semester = row.get("current_semester") or (members[0].get("current_semester", members[0].get("semester")) if members else None)
-        row.update({"student_count": count, "current_semester": current_semester, "status": "active" if count else row.get("status", "empty")}); rows.append(row)
+        row.update({"student_count": count, "current_semester": current_semester, "status": "active" if count else row.get("status", "empty")})
+        rows.append(row)
     return jsonify({"series": sorted(rows, key=lambda row: row["series"])})
 
 @app.route("/api/admin/series", methods=["POST", "PUT"])
@@ -529,9 +576,11 @@ def admin_courses():
     if teacher_id:
         ids = {row["course_id"] for row in database.course_assignments.find({"teacher_id": teacher_id, "status": "active"})}; rows = [row for row in rows if row["course_id"] in ids]
     if code: rows = [row for row in rows if code in row.get("course_code", "").lower()]
+    assignments = {a["course_id"]: a for a in database.course_assignments.find({"semester": semester, "status": "active"})}
+    teachers_map = {t["teacher_id"]: t for t in database.teachers.find({})}
     for row in rows:
-        assignment = database.course_assignments.find_one({"course_id": row["course_id"], "semester": semester, "status": "active"})
-        teacher = database.teachers.find_one({"teacher_id": assignment["teacher_id"]}) if assignment else None
+        assignment = assignments.get(row["course_id"])
+        teacher = teachers_map.get(assignment["teacher_id"]) if assignment else None
         row["assigned_teacher"] = {"teacher_id": teacher["teacher_id"], "name": teacher.get("name")} if teacher else None
     return jsonify({"courses": rows})
 
@@ -557,7 +606,18 @@ def assignment_details(assignment):
 
 @app.get("/api/admin/course-assignments")
 @require_admin
-def list_assignments(): return jsonify({"assignments": [assignment_details(row) for row in database.course_assignments.find({"status": "active"})]})
+def list_assignments():
+    assignments = list(database.course_assignments.find({"status": "active"}))
+    course_map = {c["course_id"]: c for c in database.courses.find({})}
+    teacher_map = {t["teacher_id"]: t for t in database.teachers.find({})}
+    rows = []
+    for a in assignments:
+        item = public(a)
+        course = course_map.get(a.get("course_id"), {})
+        teacher = teacher_map.get(a.get("teacher_id"), {})
+        item.update({"course_name": course.get("course_name"), "course_type": course.get("course_type"), "teacher_name": teacher.get("name")})
+        rows.append(item)
+    return jsonify({"assignments": rows})
 
 @app.post("/api/admin/course-assignments")
 @require_admin
@@ -613,6 +673,33 @@ def update_user(username):
         database.students.update_one({"student_id": username}, {"$set": {"status": status}})
         database.students.update_one({"roll": username}, {"$set": {"status": status}})
     return jsonify({"message": "User status updated successfully."})
+
+@app.route("/api/teacher/profile", methods=["GET", "PUT"])
+@require_teacher
+def teacher_profile():
+    teacher = database.teachers.find_one({"teacher_id": request.teacher_id})
+    if not teacher: return error("Teacher profile not found", 404)
+    if request.method == "GET":
+        data = public(teacher)
+        if not data.get("contact_no"):
+            data["contact_no"] = data.get("phone", f"+880 1711-0000{request.teacher_id[-2:] if len(request.teacher_id)>=2 else '01'}")
+        return jsonify({"profile": data})
+    payload = request.get_json(silent=True) or {}
+    updates = {}
+    if "name" in payload and payload["name"].strip(): updates["name"] = payload["name"].strip()
+    if "email" in payload and payload["email"].strip(): updates["email"] = payload["email"].strip()
+    cno = payload.get("contact_no") or payload.get("phone")
+    if cno and cno.strip():
+        updates["contact_no"] = cno.strip()
+        updates["phone"] = cno.strip()
+    if "department" in payload and payload["department"].strip(): updates["department"] = payload["department"].strip()
+    if updates:
+        database.teachers.update_one({"teacher_id": request.teacher_id}, {"$set": updates})
+        teacher = database.teachers.find_one({"teacher_id": request.teacher_id})
+    data = public(teacher)
+    if not data.get("contact_no"):
+        data["contact_no"] = data.get("phone", f"+880 1711-0000{request.teacher_id[-2:] if len(request.teacher_id)>=2 else '01'}")
+    return jsonify({"message": "Profile updated successfully.", "profile": data})
 
 @app.get("/api/teacher/courses")
 @require_teacher
@@ -916,11 +1003,9 @@ def grade_assignment(course_code, assignment_id, roll):
     return jsonify({"message": "Marks saved successfully.", "status": "Graded", "marks": marks, "feedback": feedback})
 
 
-@app.get("/api/teacher/courses/<path:course_code>/performance")
-@require_teacher
-def performance(course_code):
-    course, response = owned_course(course_code)
-    if response: return response
+def generate_teacher_report(course):
+    att_rows = {row["roll"]: row for row in attendance_summary(course)}
+    ct_rows = {row["roll"]: row for row in test_summary(course)}
     
     all_submissions = list(database.assignment_submissions.find({"course_id": course["course_id"]}))
     sub_scores_map = {}
@@ -930,32 +1015,66 @@ def performance(course_code):
         total_m = sub.get("total_marks")
         marks = sub.get("marks")
         if total_m and marks is not None and isinstance(marks, (int, float)):
-            score = (float(marks) / float(total_m)) * 20.0
+            score = (float(marks) / float(total_m)) * 10.0
             if roll is not None:
                 sub_scores_map.setdefault(str(roll), []).append(score)
-            if sid is not None and sid != roll:
+            if sid is not None and str(sid) != str(roll):
                 sub_scores_map.setdefault(str(sid), []).append(score)
 
-    tests = {row["roll"]: row for row in test_summary(course)}
-    att_rows = attendance_summary(course)
-    results = []
-    
-    for att in att_rows:
-        roll = att["roll"]
-        ct = tests.get(roll, {}).get("best_3_average") or 0
-        scores = sub_scores_map.get(str(roll), [])
-        assignment = round(sum(scores) / len(scores), 2) if scores else 0
-        overall = round(att["attendance_percentage"] * 0.5 + (ct / 20.0) * 35.0 + (assignment / 20.0) * 15.0, 2)
+    rows = []
+    for student in students_for(course):
+        roll = student["roll"]
+        name = student["name"]
         
+        att_info = att_rows.get(roll, {})
+        att_pct = att_info.get("attendance_percentage", 0)
+        att_marks = get_attendance_marks(att_pct)
+        
+        ct_info = ct_rows.get(roll, {})
+        ct_avg = ct_info.get("best_3_average")
+        ct_marks = float(ct_avg) if ct_avg is not None else 0.0
+        
+        assign_scores = sub_scores_map.get(str(roll), [])
+        assign_marks = round(sum(assign_scores) / len(assign_scores), 2) if assign_scores else 0.0
+        
+        total_marks = round(ct_marks + assign_marks + att_marks, 2)
+        
+        rows.append({
+            "roll": roll,
+            "name": name,
+            "ct_marks": ct_marks,
+            "assignment_marks": assign_marks,
+            "attendance_marks": att_marks,
+            "attendance_percentage": att_pct,
+            "total_marks": total_marks
+        })
+    return rows
+
+@app.get("/api/teacher/courses/<path:course_code>/performance")
+@require_teacher
+def performance(course_code):
+    course, response = owned_course(course_code)
+    if response: return response
+    
+    report_rows = generate_teacher_report(course)
+    att_rows = {row["roll"]: row for row in attendance_summary(course)}
+    results = []
+    for r in report_rows:
+        roll = r["roll"]
+        att = att_rows.get(roll, {})
+        total_40 = r["total_marks"]
+        overall = round((total_40 / 40.0) * 100.0, 2)
         results.append({
             "roll": roll,
-            "name": att["name"],
-            "classes_held": att["total_held"],
-            "present": att["present"],
-            "absent": att["absent"],
-            "attendance_percentage": att["attendance_percentage"],
-            "ct_best_3_average": ct,
-            "assignment_average": assignment,
+            "name": r["name"],
+            "classes_held": att.get("total_held", 0),
+            "present": att.get("present", 0),
+            "absent": att.get("absent", 0),
+            "attendance_percentage": r["attendance_percentage"],
+            "attendance_marks": r["attendance_marks"],
+            "ct_best_3_average": r["ct_marks"],
+            "assignment_average": r["assignment_marks"],
+            "total_marks": total_40,
             "overall_performance": overall,
             "risk_level": "Low" if overall >= 80 else "Medium" if overall >= 60 else "High"
         })
@@ -969,6 +1088,9 @@ def reports(course_code, report_type):
     if report_type == "attendance": return jsonify({"report": report_type, "rows": attendance_summary(course)})
     if report_type == "class-tests": return jsonify({"report": report_type, "rows": test_summary(course)})
     if report_type == "performance": return performance(course_code)
+    if report_type in ("summary", "teacher-report", "final", "teacher", "evaluation"):
+        rows = generate_teacher_report(course)
+        return jsonify({"report": report_type, "students": rows, "rows": rows})
     return error("Unknown report type", 404)
 
 @app.get("/api/teacher/courses/<path:course_code>/reports/<report_type>/export")
@@ -978,29 +1100,174 @@ def export_report(course_code, report_type):
     if response: return response
     if report_type == "attendance":
         rows = attendance_summary(course)
-        headers = ["Roll", "Name"] + [f"W{week}D{day}" for week in range(1,14) for day in range(1,6)] + ["Total Held", "Present", "Absent", "Attendance %"]
-        values = [[row["roll"], row["name"]] + [row["attendance"][f"w{week}d{day}"] for week in range(1,14) for day in range(1,6)] + [row["total_held"], row["present"], row["absent"], row["attendance_percentage"]] for row in rows]
+        headers = ["Roll", "Name"] + [f"W{week}D{day}" for week in range(1,14) for day in range(1,6)] + ["Total Held", "Present", "Absent", "Attendance %", "Attendance Marks (10)"]
+        values = [[row["roll"], row["name"]] + [row["attendance"][f"w{week}d{day}"] for week in range(1,14) for day in range(1,6)] + [row["total_held"], row["present"], row["absent"], row["attendance_percentage"], row.get("attendance_marks", 0)] for row in rows]
     elif report_type == "class-tests":
         rows = test_summary(course); headers = ["Roll", "Name", "CT1", "CT2", "CT3", "CT4", "Best 3 Average"]; values = [[row["roll"], row["name"], row["ct1"], row["ct2"], row["ct3"], row["ct4"], row["best_3_average"]] for row in rows]
-    elif report_type == "performance":
-        rows = attendance_summary(course); test_rows = {row["roll"]: row for row in test_summary(course)}; headers = ["Roll", "Name", "Held", "Present", "Absent", "Attendance %", "CT Best 3 Avg"]
-        values = [[row["roll"], row["name"], row["total_held"], row["present"], row["absent"], row["attendance_percentage"], test_rows[row["roll"]]["best_3_average"]] for row in rows]
+    elif report_type in ("performance", "teacher-report", "summary", "final", "teacher", "evaluation"):
+        rows = generate_teacher_report(course)
+        headers = ["Student Roll", "Total Marks (out of 40)", "CT Marks (out of 20)", "Assignment Marks (out of 10)", "Attendance Marks (out of 10)"]
+        values = [[row["roll"], row["total_marks"], row["ct_marks"], row["assignment_marks"], row["attendance_marks"]] for row in rows]
     else: return error("Unknown report type", 404)
     filename = f"{course['course_id']}-{report_type}"
     if request.args.get("format") == "xlsx":
-        book = Workbook(); sheet = book.active; sheet.title = report_type.title(); sheet.append(headers)
+        book = Workbook(); sheet = book.active; sheet.title = report_type.title()[:31]; sheet.append(headers)
         for row in values: sheet.append(row)
         stream = BytesIO(); book.save(stream)
         return app.response_class(stream.getvalue(), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f"attachment; filename={filename}.xlsx"})
     if request.args.get("format") == "pdf":
-        stream = BytesIO(); document = SimpleDocTemplate(stream, pagesize=landscape(A3)); table = Table([headers] + values, repeatRows=1)
-        table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0d47a1")), ("TEXTCOLOR", (0,0), (-1,0), colors.white), ("GRID", (0,0), (-1,-1), .25, colors.grey), ("FONTSIZE", (0,0), (-1,-1), 5)])); document.build([table])
-        return app.response_class(stream.getvalue(), mimetype="application/pdf", headers={"Content-Disposition": f"attachment; filename={filename}.pdf"})
-    return error("Use format=xlsx or format=pdf")
+        stream = BytesIO()
+        document = SimpleDocTemplate(
+            stream,
+            pagesize=A4,
+            leftMargin=36,
+            rightMargin=36,
+            topMargin=36,
+            bottomMargin=36
+        )
+        
+        styles = getSampleStyleSheet()
+        
+        center_style = ParagraphStyle(
+            'HeaderCenter',
+            parent=styles['Normal'],
+            alignment=TA_CENTER,
+            fontName='Helvetica-Oblique',
+            fontSize=10,
+            leading=13,
+            textColor=colors.HexColor('#333333')
+        )
+        
+        univ_style = ParagraphStyle(
+            'UnivHeader',
+            parent=styles['Normal'],
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold',
+            fontSize=13,
+            leading=16,
+            textColor=colors.HexColor('#000000')
+        )
+        
+        dept_style = ParagraphStyle(
+            'DeptHeader',
+            parent=styles['Normal'],
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold',
+            fontSize=11,
+            leading=14,
+            textColor=colors.HexColor('#000000')
+        )
+        
+        box_style = ParagraphStyle(
+            'BoxHeader',
+            parent=styles['Normal'],
+            alignment=TA_CENTER,
+            fontName='Helvetica-Bold',
+            fontSize=12,
+            leading=16,
+            textColor=colors.HexColor('#000000')
+        )
+        
+        right_style = ParagraphStyle(
+            'FooterRight',
+            parent=styles['Normal'],
+            alignment=TA_RIGHT,
+            fontName='Helvetica',
+            fontSize=10,
+            leading=14,
+            textColor=colors.HexColor('#000000')
+        )
 
-@app.get("/")
-def index():
-    return jsonify({"status": "ok", "message": "Smart Attendance System API", "database": "in-memory development fallback" if database.using_in_memory_database else "mongodb"})
+        teacher_info = database.teachers.find_one({"teacher_id": course.get("teacher_id")}) or {}
+        t_id = course.get("teacher_id") or teacher_info.get("teacher_id", "T01")
+        t_name = teacher_info.get("name", "")
+
+        story = []
+        
+        if report_type in ("performance", "teacher-report", "summary", "final", "teacher", "evaluation"):
+            # 1. Header Text
+            story.append(Paragraph("Heaven's light is our guide", center_style))
+            story.append(Paragraph("Rajshahi University of Engineering & Technology", univ_style))
+            story.append(Paragraph("Department of Electronics & Telecommunication Engineering", dept_style))
+            story.append(Spacer(1, 10))
+            
+            # 2. Boxed Sub-Header Block
+            course_text = f"Continuous Assessment Marks on<br/><font size=13><b>{course.get('course_code')} ({course.get('course_name')})</b></font>"
+            box_table = Table([[Paragraph(course_text, box_style)]], colWidths=[522])
+            box_table.setStyle(TableStyle([
+                ('BOX', (0,0), (-1,-1), 1.5, colors.HexColor('#000000')),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('TOPPADDING', (0,0), (-1,-1), 8),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ]))
+            story.append(box_table)
+            story.append(Spacer(1, 15))
+            
+            # 3. Marks Table
+            table_data = [[
+                Paragraph("<b>Student Roll</b>", ParagraphStyle('TH', parent=styles['Normal'], alignment=TA_CENTER, fontName='Helvetica-Bold', textColor=colors.white)),
+                Paragraph("<b>Total Marks<br/>(out of 40)</b>", ParagraphStyle('TH', parent=styles['Normal'], alignment=TA_CENTER, fontName='Helvetica-Bold', textColor=colors.white)),
+                Paragraph("<b>CT Marks<br/>(out of 20)</b>", ParagraphStyle('TH', parent=styles['Normal'], alignment=TA_CENTER, fontName='Helvetica-Bold', textColor=colors.white)),
+                Paragraph("<b>Assignment Marks<br/>(out of 10)</b>", ParagraphStyle('TH', parent=styles['Normal'], alignment=TA_CENTER, fontName='Helvetica-Bold', textColor=colors.white)),
+                Paragraph("<b>Attendance Marks<br/>(out of 10)</b>", ParagraphStyle('TH', parent=styles['Normal'], alignment=TA_CENTER, fontName='Helvetica-Bold', textColor=colors.white)),
+            ]]
+            
+            for row in values:
+                table_data.append([
+                    str(row[0]),
+                    str(row[1]),
+                    str(row[2]),
+                    str(row[3]),
+                    str(row[4])
+                ])
+                
+            marks_table = Table(table_data, colWidths=[95, 110, 105, 110, 102], repeatRows=1)
+            marks_table.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0d47a1')),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#444444')),
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0,0), (-1,-1), 9),
+                ('TOPPADDING', (0,0), (-1,-1), 5),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ]))
+            story.append(marks_table)
+            story.append(Spacer(1, 30))
+            
+            # 4. Footer Signature Block
+            footer_html = f"Teacher ID: {t_id}<br/>"
+            if t_name:
+                footer_html += f"<b>{t_name}</b><br/>"
+            footer_html += "Professor<br/>Dept. of ETE, RUET"
+            
+            footer_table = Table([["", Paragraph(footer_html, right_style)]], colWidths=[300, 222])
+            footer_table.setStyle(TableStyle([
+                ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                ('ALIGN', (1,0), (1,0), 'RIGHT'),
+            ]))
+            story.append(KeepTogether([footer_table]))
+        else:
+            table = Table([headers] + values, repeatRows=1)
+            table.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#0d47a1")),
+                ("TEXTCOLOR", (0,0), (-1,0), colors.white),
+                ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                ("GRID", (0,0), (-1,-1), 0.5, colors.grey),
+                ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+                ("FONTSIZE", (0,0), (-1,-1), 9)
+            ]))
+            story.append(table)
+            
+        document.build(story)
+        return app.response_class(
+            stream.getvalue(),
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}.pdf"}
+        )
+    return error("Use format=xlsx or format=pdf")
 
 @app.get("/api/health")
 def health(): return jsonify({"status": "ok", "database": "in-memory development fallback" if database.using_in_memory_database else "mongodb"})

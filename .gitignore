@@ -1,0 +1,19 @@
+# Python / virtual environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Environment variables (NEVER COMMIT)
+.env
+.env.local
+.env.*.local
+
+# Node / Frontend
+node_modules/
+dist/
+build/
+
+# Uploaded assignment files / test artifacts
+uploads/assignments/*
+!uploads/assignments/.gitkeep
+scratch/

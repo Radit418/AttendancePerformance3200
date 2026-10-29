@@ -85,6 +85,9 @@ class InMemoryCollection:
         self.documents = [row for row in self.documents if not self._matches(row, query)]
         return UpdateResult(previous - len(self.documents), previous - len(self.documents))
 
+    def count_documents(self, query=None):
+        return len(self.find(query or {}))
+
     def update_many(self, query, update):
         count = 0
         for row in self.documents:
@@ -169,7 +172,7 @@ def seed_development_data():
     for number in range(1, 9): semesters.insert_one({"semester": number, "department": "ETE", "status": "current" if number == 6 else "completed" if number < 6 else "upcoming"})
     for number in range(1, 16):
         teacher_id = f"T{number:02d}"
-        teachers.insert_one({"teacher_id": teacher_id, "username": teacher_id, "name": f"Dr. Teacher {number:02d}", "email": f"{teacher_id.lower()}@ete.edu", "status": "active", "department": "ETE"})
+        teachers.insert_one({"teacher_id": teacher_id, "username": teacher_id, "name": f"Dr. Teacher {number:02d}", "email": f"{teacher_id.lower()}@ete.edu", "contact_no": f"+880 1711-0000{number:02d}", "status": "active", "department": "ETE"})
     users.insert_one({"username": "admin", "password_hash": generate_password_hash("Admin@123"), "role": "admin", "status": "active", "token_version": 0})
     for teacher in teachers.find({}):
         users.insert_one({"username": teacher["teacher_id"], "password_hash": generate_password_hash("Teacher@123"), "role": "teacher", "teacher_id": teacher["teacher_id"], "status": "active", "token_version": 0})
