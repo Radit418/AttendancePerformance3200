@@ -559,6 +559,58 @@ function Assignments({ course, token, notify }) {
     }
   };
 
+  const unsubmitTeacherFile = async () => {
+    if (!selectedAssignment || !selectedAssignment.ref_file_name) return;
+    if (!window.confirm(`Are you sure you want to unsubmit / remove the file for Assignment ${selectedAssignment.assignment_number}? You can upload a new file if you mistakenly uploaded this one.`)) return;
+    try {
+      const res = await call(
+        `/api/teacher/courses/${encodeURIComponent(course.course_code)}/assignments/${selectedAssignment.assignment_id}/unsubmit-file`,
+        token,
+        { method: 'POST' }
+      );
+      notify(res.message || 'Assignment file unsubmitted successfully.');
+      load();
+    } catch (e) {
+      notify(e.message, 'danger');
+    }
+  };
+
+  const changeTeacherFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !selectedAssignment) return;
+    const form = new FormData();
+    form.append('ref_file', file);
+    try {
+      const res = await submitForm(
+        `/api/teacher/courses/${encodeURIComponent(course.course_code)}/assignments/${selectedAssignment.assignment_id}/upload-file`,
+        token,
+        form
+      );
+      notify(res.message || 'Assignment file updated successfully.');
+      load();
+    } catch (err) {
+      notify(err.message, 'danger');
+    } finally {
+      e.target.value = '';
+    }
+  };
+
+  const unsubmitStudentSubmission = async (roll) => {
+    if (!selectedAssignment) return;
+    if (!window.confirm(`Are you sure you want to unsubmit the submission for Roll ${roll}? The student will be able to upload a new file.`)) return;
+    try {
+      const res = await call(
+        `/api/teacher/courses/${encodeURIComponent(course.course_code)}/assignments/${selectedAssignment.assignment_id}/submissions/${roll}/unsubmit`,
+        token,
+        { method: 'POST' }
+      );
+      notify(res.message || `Submission for Roll ${roll} unsubmitted successfully.`);
+      load();
+    } catch (e) {
+      notify(e.message, 'danger');
+    }
+  };
+
   const getFileUrl = (filename, isDownload = false) =>
     `${API}/api/assignments/files/${encodeURIComponent(filename)}?token=${encodeURIComponent(token)}${isDownload ? '&download=1' : ''}`;
 
@@ -642,22 +694,56 @@ function Assignments({ course, token, notify }) {
                     <span className="ms-3">Total Marks: <b>{selectedAssignment.total_marks}</b></span>
                   </div>
                 </div>
-                {selectedAssignment.ref_file_name && (
-                  <div className="d-flex gap-2">
-                    <button
-                      type="button"
-                      className="btn btn-outline-primary btn-sm"
-                      onClick={() => viewFileInBrowser(getFileUrl(selectedAssignment.ref_file_name, false))}
-                    >
-                      👁️ View Online
-                    </button>
-                    <a
-                      href={getFileUrl(selectedAssignment.ref_file_name, true)}
-                      className="btn btn-outline-secondary btn-sm"
-                      download
-                    >
-                      📥 Download
-                    </a>
+                {selectedAssignment.ref_file_name ? (
+                  <div className="d-flex flex-column align-items-end gap-2">
+                    <div className="d-flex gap-2 align-items-center flex-wrap">
+                      <button
+                        type="button"
+                        className="btn btn-outline-primary btn-sm"
+                        onClick={() => viewFileInBrowser(getFileUrl(selectedAssignment.ref_file_name, false))}
+                      >
+                        👁️ View Online
+                      </button>
+                      <a
+                        href={getFileUrl(selectedAssignment.ref_file_name, true)}
+                        className="btn btn-outline-secondary btn-sm"
+                        download
+                      >
+                        📥 Download
+                      </a>
+                      <button
+                        type="button"
+                        className="btn btn-outline-danger btn-sm"
+                        onClick={unsubmitTeacherFile}
+                        title="Unsubmit mistakenly uploaded file"
+                      >
+                        🔄 Unsubmit File
+                      </button>
+                    </div>
+                    <div className="d-flex align-items-center gap-2">
+                      <label className="btn btn-sm btn-outline-secondary py-1 px-2 mb-0" style={{ cursor: 'pointer' }}>
+                        ✏️ Change File
+                        <input
+                          type="file"
+                          hidden
+                          accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.jpg,.jpeg,.png"
+                          onChange={changeTeacherFile}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="d-flex align-items-center gap-2">
+                    <span className="text-muted small">No file attached</span>
+                    <label className="btn btn-sm btn-outline-primary py-1 px-2 mb-0" style={{ cursor: 'pointer' }}>
+                      📎 Upload File
+                      <input
+                        type="file"
+                        hidden
+                        accept=".pdf,.doc,.docx,.ppt,.pptx,.txt,.jpg,.jpeg,.png"
+                        onChange={changeTeacherFile}
+                      />
+                    </label>
                   </div>
                 )}
               </div>
@@ -668,12 +754,12 @@ function Assignments({ course, token, notify }) {
                   <thead className="table-light">
                     <tr>
                       <th style={{ width: '10%' }}>Roll</th>
-                      <th style={{ width: '18%' }}>Student Name</th>
+                      <th style={{ width: '16%' }}>Student Name</th>
                       <th style={{ width: '14%' }}>Submission</th>
-                      <th style={{ width: '22%' }}>Text / File</th>
+                      <th style={{ width: '20%' }}>Text / File</th>
                       <th style={{ width: '14%' }}>Marks</th>
                       <th style={{ width: '14%' }}>Feedback</th>
-                      <th style={{ width: '8%' }}>Action</th>
+                      <th style={{ width: '12%' }}>Action</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -759,13 +845,25 @@ function Assignments({ course, token, notify }) {
                             />
                           </td>
                           <td>
-                            <button
-                              className="btn btn-sm btn-success"
-                              onClick={() => saveMarks(roll)}
-                              disabled={savingRoll === roll}
-                            >
-                              {savingRoll === roll ? 'Saving...' : 'Save Marks'}
-                            </button>
+                            <div className="d-flex gap-1 align-items-center">
+                              <button
+                                className="btn btn-sm btn-success"
+                                onClick={() => saveMarks(roll)}
+                                disabled={savingRoll === roll}
+                              >
+                                {savingRoll === roll ? 'Saving...' : 'Save Marks'}
+                              </button>
+                              {isSubmitted && (
+                                <button
+                                  type="button"
+                                  className="btn btn-sm btn-outline-danger"
+                                  title="Unsubmit student's submission"
+                                  onClick={() => unsubmitStudentSubmission(roll)}
+                                >
+                                  🔄 Unsubmit
+                                </button>
+                              )}
+                            </div>
                           </td>
                         </tr>
                       );
@@ -866,7 +964,7 @@ function StudentDashboard({auth,logout}){
   const open=async item=>{try{setCourse(item);const code=encodeURIComponent(item.course_code);const [overview,attendance,tests,assignments]=await Promise.all([call(`/api/student/courses/${code}`,auth.token),call(`/api/student/courses/${code}/attendance`,auth.token),call(`/api/student/courses/${code}/class-tests`,auth.token),call(`/api/student/courses/${code}/assignments`,auth.token)]);setDetail({...overview,attendanceData:attendance,testsData:tests,assignmentsData:assignments});}catch(e){setNotice(e.message);setCourse(null)}};
   useEffect(()=>{load()},[]);
   const submit=async(e,assignment)=>{e.preventDefault();const form=new FormData(e.currentTarget);try{const result=await submitForm(`/api/student/courses/${encodeURIComponent(course.course_code)}/assignments/${assignment.assignment_id}/submit`,auth.token,form);setNotice(result.message);await open(course);load();}catch(err){setNotice(err.message)}};
-  const unsubmit=async(assignment)=>{if(!window.confirm(`Are you sure you want to remove your submission for Assignment ${assignment.assignment_number}?`))return;try{const result=await call(`/api/student/courses/${encodeURIComponent(course.course_code)}/assignments/${assignment.assignment_id}/unsubmit`,auth.token,{method:'DELETE'});setNotice(result.message);await open(course);load();}catch(err){setNotice(err.message)}};
+  const unsubmit=async(assignment)=>{if(!window.confirm(`Are you sure you want to unsubmit Assignment ${assignment.assignment_number}? You can upload a new file after unsubmitting.`))return;try{const result=await call(`/api/student/courses/${encodeURIComponent(course.course_code)}/assignments/${assignment.assignment_id}/unsubmit`,auth.token,{method:'POST'});setNotice(result.message||'Assignment unsubmitted successfully.');await open(course);load();}catch(err){setNotice(err.message)}};
   const finish=()=>{sessionStorage.removeItem('authToken');logout()};
   const navItems=[
     {id:'Dashboard',icon:'🏠',label:'Dashboard'},
@@ -1137,13 +1235,6 @@ function StudentDashboard({auth,logout}){
                   </div>
                 )}
 
-                {a.text_answer&&(
-                  <div className="cd-submitted-text">
-                    <span className="cd-submitted-text-label">📄 Your Submitted Answer</span>
-                    <p>{a.text_answer}</p>
-                  </div>
-                )}
-
                 {a.file_name&&(
                   <div className="cd-asgn-ref-files mt-2">
                     <span className="cd-ref-label">📁 Your Submitted File:</span>
@@ -1154,17 +1245,18 @@ function StudentDashboard({auth,logout}){
                 {/* Submit form */}
                 {a.submission_status==='Not Submitted'?(
                   <form className="cd-submit-form" onSubmit={e=>submit(e,a)}>
-                    <div className="cd-submit-form-title">✏️ Submit Your Answer</div>
-                    <textarea name="text_answer" className="cd-textarea" rows="3" placeholder="Type your text answer here (optional if uploading a file)"/>
                     <label className="cd-file-label">
                       <span>📎 Upload Submission File</span>
-                      <input name="file" type="file" className="cd-file-input" accept=".pdf,.doc,.docx,.txt,.ppt,.pptx,.jpg,.jpeg,.png"/>
+                      <input name="file" type="file" className="cd-file-input" accept=".pdf,.doc,.docx,.txt,.ppt,.pptx,.jpg,.jpeg,.png" required />
                     </label>
-                    <button className="cd-submit-btn">🚀 Submit Assignment</button>
+                    <button className="cd-submit-btn" type="submit">🚀 Submit Assignment</button>
                   </form>
                 ):(
                   a.submission_status!=='Graded'&&(
-                    <button className="cd-remove-btn" onClick={()=>unsubmit(a)}>🗑️ Remove Submission</button>
+                    <div className="cd-unsubmit-wrap">
+                      <button type="button" className="cd-unsubmit-btn" onClick={()=>unsubmit(a)}>🔄 Unsubmit Assignment</button>
+                      <div className="cd-unsubmit-hint">Mistakenly uploaded the wrong file? Unsubmit to remove it and upload a new one.</div>
+                    </div>
                   )
                 )}
               </div>

@@ -388,6 +388,9 @@ def submit_student_assignment(course_code, assignment_id):
     existing = database.assignment_submissions.find_one({"assignment_id": assignment_id, "student_id": student["student_id"]})
     if not file_name and not (existing or {}).get("file_name"):
         return error("Please select an assignment file to upload.", 400)
+    if file_name and existing and existing.get("file_path") and os.path.exists(existing["file_path"]):
+        try: os.remove(existing["file_path"])
+        except OSError: pass
     row = {
         "assignment_id": assignment_id,
         "course_id": course["course_id"],
@@ -414,12 +417,14 @@ def unsubmit_student_assignment(course_code, assignment_id):
     if response: return response
     existing = database.assignment_submissions.find_one({"assignment_id": assignment_id, "student_id": student["student_id"]})
     if not existing: return error("Submission not found", 404)
+    if existing.get("status") == "Graded" or existing.get("marks") is not None:
+        return error("Graded assignments cannot be unsubmitted.", 400)
     file_path = existing.get("file_path")
     if file_path and os.path.exists(file_path):
         try: os.remove(file_path)
         except OSError: pass
     database.assignment_submissions.delete_one({"assignment_id": assignment_id, "student_id": student["student_id"]})
-    return jsonify({"message": "Assignment submission removed successfully."})
+    return jsonify({"message": "Assignment unsubmitted successfully."})
 
 @app.get("/api/admin/dashboard")
 @require_admin
@@ -1001,6 +1006,75 @@ def grade_assignment(course_code, assignment_id, roll):
         upsert=True
     )
     return jsonify({"message": "Marks saved successfully.", "status": "Graded", "marks": marks, "feedback": feedback})
+
+
+@app.route("/api/teacher/courses/<path:course_code>/assignments/<assignment_id>/unsubmit-file", methods=["POST", "DELETE"])
+@require_teacher
+def unsubmit_teacher_assignment_file(course_code, assignment_id):
+    course, response = owned_course(course_code)
+    if response: return response
+    assignment = database.assignments.find_one({"assignment_id": assignment_id, "course_id": course["course_id"]})
+    if not assignment: return error("Assignment not found", 404)
+    file_path = assignment.get("ref_file_path")
+    if file_path and os.path.exists(file_path):
+        try: os.remove(file_path)
+        except OSError: pass
+    database.assignments.update_one(
+        {"assignment_id": assignment_id, "course_id": course["course_id"]},
+        {"$set": {"ref_file_name": None, "ref_file_path": None}}
+    )
+    return jsonify({"message": "Assignment file unsubmitted successfully."})
+
+
+@app.post("/api/teacher/courses/<path:course_code>/assignments/<assignment_id>/upload-file")
+@require_teacher
+def upload_teacher_assignment_file(course_code, assignment_id):
+    course, response = owned_course(course_code)
+    if response: return response
+    assignment = database.assignments.find_one({"assignment_id": assignment_id, "course_id": course["course_id"]})
+    if not assignment: return error("Assignment not found", 404)
+    ref_upload = request.files.get("ref_file") or request.files.get("file")
+    if not ref_upload or not ref_upload.filename:
+        return error("Please select a file to upload.", 400)
+    ext = ref_upload.filename.rsplit(".", 1)[-1].lower() if "." in ref_upload.filename else ""
+    if ext not in ALLOWED_ASSIGNMENT_EXTENSIONS:
+        return error(f"Unsupported reference file type. Allowed: {', '.join(sorted(ALLOWED_ASSIGNMENT_EXTENSIONS))}")
+    ref_upload.seek(0, os.SEEK_END)
+    size = ref_upload.tell()
+    ref_upload.seek(0)
+    if size > 10 * 1024 * 1024:
+        return error("File exceeds maximum size of 10 MB", 400)
+    old_file_path = assignment.get("ref_file_path")
+    if old_file_path and os.path.exists(old_file_path):
+        try: os.remove(old_file_path)
+        except OSError: pass
+    s_name = secure_filename(ref_upload.filename)
+    stored_name = f"ref_{uuid4()}_{s_name}"
+    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
+    full_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
+    ref_upload.save(full_path)
+    database.assignments.update_one(
+        {"assignment_id": assignment_id, "course_id": course["course_id"]},
+        {"$set": {"ref_file_name": stored_name, "ref_file_path": full_path}}
+    )
+    return jsonify({"message": "Assignment file updated successfully.", "ref_file_name": stored_name})
+
+
+@app.route("/api/teacher/courses/<path:course_code>/assignments/<assignment_id>/submissions/<roll>/unsubmit", methods=["POST", "DELETE"])
+@require_teacher
+def teacher_unsubmit_student_submission(course_code, assignment_id, roll):
+    course, response = owned_course(course_code)
+    if response: return response
+    sub = database.assignment_submissions.find_one({"assignment_id": assignment_id, "course_id": course["course_id"], "roll": roll}) or \
+          database.assignment_submissions.find_one({"assignment_id": assignment_id, "course_id": course["course_id"], "student_id": roll})
+    if not sub:
+        return error("Submission not found", 404)
+    file_path = sub.get("file_path")
+    if file_path and os.path.exists(file_path):
+        try: os.remove(file_path)
+        except OSError: pass
+    database.assignment_submissions.delete_one({"_id": sub["_id"]})
+    return jsonify({"message": f"Submission for Roll {roll} has been unsubmitted successfully."})
 
 
 def generate_teacher_report(course):
