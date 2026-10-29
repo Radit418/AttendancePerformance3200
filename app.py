@@ -145,7 +145,7 @@ def slots(course):
     saved = {(row["week"], row["day"]): public(row) for row in database.class_sessions.find({"course_id": course["course_id"]})}
     all_slots = []
     for week in range(1, 14):
-        for day in range(1, 6):
+        for day in range(1, 4):
             default = {"course_id": course["course_id"], "course_code": course.get("course_code", ""), "series": course.get("series", 22), "semester": course.get("semester", 6), "week": week, "day": day, "date": (start + timedelta(days=(week - 1) * 7 + day - 1)).isoformat(), "class_held": False, "teacher_id": course.get("teacher_id", "")}
             all_slots.append(saved.get((week, day), default))
     return all_slots
@@ -168,7 +168,7 @@ def attendance_summary(course):
         present = sum(stored.get((student["roll"], week, day)) == "Present" for week, day in held)
         total = len(held); pct = round(present * 100 / total, 2) if total else 0
         att_marks = get_attendance_marks(pct)
-        cells = {f"w{week}d{day}": stored.get((student["roll"], week, day), "") for week in range(1, 14) for day in range(1, 6)}
+        cells = {f"w{week}d{day}": stored.get((student["roll"], week, day), "") for week in range(1, 14) for day in range(1, 4)}
         rows.append({**student, "attendance": cells, "total_held": total, "present": present, "absent": total-present, "attendance_percentage": pct, "attendance_marks": att_marks, "attendance_status": "Good" if pct >= 80 else "Warning" if pct >= 70 else "Critical"})
     return rows
 def test_summary(course):
@@ -735,7 +735,7 @@ def sessions(course_code):
     if response: return response
     if request.method == "GET": return jsonify({"course_start_date": course.get("course_start_date"), "sessions": slots(course)})
     payload = request.get_json(silent=True) or {}; week, day = payload.get("week"), payload.get("day")
-    if not isinstance(week, int) or not isinstance(day, int) or not 1 <= week <= 13 or not 1 <= day <= 5: return error("week must be 1-13 and day must be 1-5")
+    if not isinstance(week, int) or not isinstance(day, int) or not 1 <= week <= 13 or not 1 <= day <= 3: return error("week must be 1-13 and day must be 1-3")
     session = next(row for row in slots(course) if row["week"] == week and row["day"] == day)
     session.update({"date": payload.get("date", session["date"]), "class_held": bool(payload.get("class_held")), "teacher_id": request.teacher_id})
     database.class_sessions.update_one({"course_id": course["course_id"], "week": week, "day": day}, {"$set": session}, upsert=True)
@@ -1174,8 +1174,8 @@ def export_report(course_code, report_type):
     if response: return response
     if report_type == "attendance":
         rows = attendance_summary(course)
-        headers = ["Roll", "Name"] + [f"W{week}D{day}" for week in range(1,14) for day in range(1,6)] + ["Total Held", "Present", "Absent", "Attendance %", "Attendance Marks (10)"]
-        values = [[row["roll"], row["name"]] + [row["attendance"][f"w{week}d{day}"] for week in range(1,14) for day in range(1,6)] + [row["total_held"], row["present"], row["absent"], row["attendance_percentage"], row.get("attendance_marks", 0)] for row in rows]
+        headers = ["Roll", "Name"] + [f"W{week}D{day}" for week in range(1,14) for day in range(1,4)] + ["Total Held", "Present", "Absent", "Attendance %", "Attendance Marks (10)"]
+        values = [[row["roll"], row["name"]] + [row["attendance"][f"w{week}d{day}"] for week in range(1,14) for day in range(1,4)] + [row["total_held"], row["present"], row["absent"], row["attendance_percentage"], row.get("attendance_marks", 0)] for row in rows]
     elif report_type == "class-tests":
         rows = test_summary(course); headers = ["Roll", "Name", "CT1", "CT2", "CT3", "CT4", "Best 3 Average"]; values = [[row["roll"], row["name"], row["ct1"], row["ct2"], row["ct3"], row["ct4"], row["best_3_average"]] for row in rows]
     elif report_type in ("performance", "teacher-report", "summary", "final", "teacher", "evaluation"):

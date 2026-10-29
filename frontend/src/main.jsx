@@ -136,7 +136,7 @@ function Attendance({ course, token, notify }) {
         <div className="col-md-2">
           <label className="form-label">Day</label>
           <select className="form-select" value={day} onChange={e => { const v = parseInt(e.target.value, 10) || 1; setDay(v); }}>
-            {[1, 2, 3, 4, 5].map(n => <option key={n} value={n}>Day {n}</option>)}
+            {[1, 2, 3].map(n => <option key={n} value={n}>Day {n}</option>)}
           </select>
         </div>
         <div className="col-md-3">
@@ -214,7 +214,7 @@ function Attendance({ course, token, notify }) {
     <Spreadsheet students={data.students} />
   </>;
 }
-function Spreadsheet({ students }) { return <div className="card"><div className="card-header"><b>13-week attendance spreadsheet</b><small className="ms-2 text-muted">Only confirmed class sessions count in percentages.</small></div><div className="sheet"><table className="table table-bordered table-sm mb-0"><thead><tr><th rowSpan="2" className="sticky-roll">Roll</th><th rowSpan="2" className="sticky-name">Name</th>{Array.from({length:13},(_,i)=><th colSpan="5" key={i}>Week {i+1}</th>)}<th rowSpan="2">Present</th><th rowSpan="2">Absent</th><th rowSpan="2">Attendance %</th><th rowSpan="2">Att Marks</th></tr><tr>{Array.from({length:65},(_,i)=><th key={i}>D{(i%5)+1}</th>)}</tr></thead><tbody>{(students || []).map(s=><tr key={s.roll}><td className="sticky-roll">{s.roll}</td><td className="sticky-name">{s.name}</td>{Array.from({length:65},(_,i)=><td key={i} className={s.attendance?.[`w${Math.floor(i/5)+1}d${(i%5)+1}`] === 'Present' ? 'present' : s.attendance?.[`w${Math.floor(i/5)+1}d${(i%5)+1}`] === 'Absent' ? 'absent' : ''}>{s.attendance?.[`w${Math.floor(i/5)+1}d${(i%5)+1}`] === 'Present' ? 'P' : s.attendance?.[`w${Math.floor(i/5)+1}d${(i%5)+1}`] === 'Absent' ? 'A' : ''}</td>)}<td>{s.present}</td><td>{s.absent}</td><td><Status value={s.attendance_status} /> {s.attendance_percentage}%</td><td><b>{s.attendance_marks ?? 0}/10</b></td></tr>)}</tbody></table></div></div> }
+function Spreadsheet({ students }) { return <div className="card"><div className="card-header"><b>13-week attendance spreadsheet</b><small className="ms-2 text-muted">Only confirmed class sessions count in percentages.</small></div><div className="sheet"><table className="table table-bordered table-sm mb-0"><thead><tr><th rowSpan="2" className="sticky-roll">Roll</th><th rowSpan="2" className="sticky-name">Name</th>{Array.from({length:13},(_,i)=><th colSpan="3" key={i}>Week {i+1}</th>)}<th rowSpan="2">Present</th><th rowSpan="2">Absent</th><th rowSpan="2">Attendance %</th><th rowSpan="2">Att Marks</th></tr><tr>{Array.from({length:39},(_,i)=><th key={i}>D{(i%3)+1}</th>)}</tr></thead><tbody>{(students || []).map(s=><tr key={s.roll}><td className="sticky-roll">{s.roll}</td><td className="sticky-name">{s.name}</td>{Array.from({length:39},(_,i)=><td key={i} className={s.attendance?.[`w${Math.floor(i/3)+1}d${(i%3)+1}`] === 'Present' ? 'present' : s.attendance?.[`w${Math.floor(i/3)+1}d${(i%3)+1}`] === 'Absent' ? 'absent' : ''}>{s.attendance?.[`w${Math.floor(i/3)+1}d${(i%3)+1}`] === 'Present' ? 'P' : s.attendance?.[`w${Math.floor(i/3)+1}d${(i%3)+1}`] === 'Absent' ? 'A' : ''}</td>)}<td>{s.present}</td><td>{s.absent}</td><td><Status value={s.attendance_status} /> {s.attendance_percentage}%</td><td><b>{s.attendance_marks ?? 0}/10</b></td></tr>)}</tbody></table></div></div> }
 
 function ClassTests({ course, token, notify }) {
   const [rows, setRows] = useState([]);
