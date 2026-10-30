@@ -50,30 +50,84 @@ function Login({ onLogin }) {
 function ChangePassword({token,onDone}){const [current,setCurrent]=useState(''),[next,setNext]=useState(''),[confirm,setConfirm]=useState(''),[message,setMessage]=useState(''),[saving,setSaving]=useState(false);const submit=async e=>{e.preventDefault();if(next!==confirm){setMessage('New passwords do not match.');return}try{setSaving(true);setMessage('');const r=await call('/api/auth/change-password',token,{method:'POST',body:JSON.stringify({current_password:current,new_password:next,confirm_password:confirm})});setMessage(r.message);setTimeout(onDone,900)}catch(e){setMessage(e.message)}finally{setSaving(false)}};return <div className="card card-body"><h5>Change Password</h5><form onSubmit={submit}><PasswordInput label="Current Password" value={current} onChange={setCurrent}/><PasswordInput label="New Password" value={next} onChange={setNext}/><small className="d-block text-muted mb-3">At least 8 characters, including uppercase, lowercase, and a number.</small><PasswordInput label="Confirm New Password" value={confirm} onChange={setConfirm}/>{message&&<div className={`alert ${message.startsWith('Password changed')?'alert-success':'alert-danger'} py-2`}>{message}</div>}<button className="btn btn-primary" disabled={saving}>{saving?'Changing Password...':'Change Password'}</button></form></div>}
 
 function Attendance({ course, token, notify }) {
-  const [data, setData] = useState(null), [week, setWeek] = useState(1), [day, setDay] = useState(1), [entries, setEntries] = useState({}), [dirty, setDirty] = useState(false), [startDate, setStartDate] = useState('');
-  const load = async (targetWeek = week, targetDay = day) => {
-    const result = await call(`/api/teacher/courses/${encodeURIComponent(course.course_code)}/attendance`, token);
+  const [data, setData] = useState(null);
+  const [week, setWeek] = useState(1);
+  const [day, setDay] = useState(1);
+  const [entries, setEntries] = useState({});
+  const [dirty, setDirty] = useState(false);
+  const [startDate, setStartDate] = useState('');
+  const [isEditing, setIsEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const numWeek = Number(week) || 1;
+  const numDay = Number(day) || 1;
+
+  const applyAttendanceData = (result, targetWeek = numWeek, targetDay = numDay) => {
     setData(result);
-    const w = Number(targetWeek) || 1, d = Number(targetDay) || 1;
-    setEntries(Object.fromEntries((result.students || []).map(s => [s.roll, s.attendance?.[`w${w}d${d}`] || 'Present'])));
+    const w = Number(targetWeek) || 1;
+    const d = Number(targetDay) || 1;
+    const currentSession = (result.sessions || []).find(s => s.week === w && s.day === d);
+    const isHeld = Boolean(currentSession && currentSession.class_held);
+
+    if (!isHeld) {
+      // Holiday / not held session: records remain blank
+      setEntries({});
+    } else {
+      const key = `w${w}d${d}`;
+      const hasSaved = (result.students || []).some(s => s.attendance?.[key] === 'Present' || s.attendance?.[key] === 'Absent');
+      if (hasSaved) {
+        setEntries(Object.fromEntries((result.students || []).map(s => [s.roll, s.attendance?.[key] || 'Present'])));
+      } else {
+        setEntries(Object.fromEntries((result.students || []).map(s => [s.roll, 'Present'])));
+      }
+    }
+    setDirty(false);
+    setIsEditing(false);
   };
-  useEffect(() => { load().catch(e => notify(e.message, 'danger')); }, [course.course_code]);
+
+  const load = async (targetWeek = numWeek, targetDay = numDay) => {
+    const result = await call(`/api/teacher/courses/${encodeURIComponent(course.course_code)}/attendance`, token);
+    applyAttendanceData(result, targetWeek, targetDay);
+  };
+
+  useEffect(() => {
+    load().catch(e => notify(e.message, 'danger'));
+  }, [course.course_code]);
+
   useEffect(() => {
     setStartDate('');
     setDirty(false);
+    setIsEditing(false);
     if (data?.students) {
-      const w = Number(week) || 1, d = Number(day) || 1;
-      setEntries(Object.fromEntries(data.students.map(s => [s.roll, s.attendance?.[`w${w}d${d}`] || 'Present'])));
+      const currentSession = (data.sessions || []).find(s => s.week === numWeek && s.day === numDay);
+      const isHeld = Boolean(currentSession && currentSession.class_held);
+      if (!isHeld) {
+        setEntries({});
+      } else {
+        const key = `w${numWeek}d${numDay}`;
+        const hasSaved = data.students.some(s => s.attendance?.[key] === 'Present' || s.attendance?.[key] === 'Absent');
+        if (hasSaved) {
+          setEntries(Object.fromEntries(data.students.map(s => [s.roll, s.attendance?.[key] || 'Present'])));
+        } else {
+          setEntries(Object.fromEntries(data.students.map(s => [s.roll, 'Present'])));
+        }
+      }
     }
   }, [week, day]);
-  if (!data) return <div className="spinner-border" />;
-  const numWeek = Number(week) || 1, numDay = Number(day) || 1;
+
+  if (!data) return <div className="spinner-border text-primary my-4" />;
+
   const session = (data.sessions || []).find(s => s.week === numWeek && s.day === numDay) || {
     week: numWeek,
     day: numDay,
     date: '',
     class_held: false
   };
+
+  const isConfirmed = Boolean(session.class_held);
+  const sessionKey = `w${numWeek}d${numDay}`;
+  const hasSavedAttendance = Boolean(isConfirmed && (data.students || []).some(s => s.attendance?.[sessionKey] === 'Present' || s.attendance?.[sessionKey] === 'Absent'));
+
   const saveSession = async held => {
     try {
       await call(`/api/teacher/courses/${encodeURIComponent(course.course_code)}/sessions`, token, {
@@ -86,27 +140,21 @@ function Attendance({ course, token, notify }) {
           ...(startDate ? { course_start_date: startDate } : {})
         })
       });
-      notify(held ? 'Class session confirmed.' : 'Session marked not held.');
+      notify(held ? `Week ${numWeek}, Day ${numDay} confirmed as class held.` : `Week ${numWeek}, Day ${numDay} marked as Holiday. Attendance disabled & cleared.`);
       await load(numWeek, numDay);
     } catch (e) {
       notify(e.message, 'danger');
     }
   };
+
   const saveAttendance = async () => {
+    if (!isConfirmed) {
+      notify('Attendance cannot be submitted for a holiday session.', 'danger');
+      return;
+    }
     try {
-      if (!session.class_held) {
-        await call(`/api/teacher/courses/${encodeURIComponent(course.course_code)}/sessions`, token, {
-          method: 'POST',
-          body: JSON.stringify({
-            week: numWeek,
-            day: numDay,
-            date: startDate || session.date || '',
-            class_held: true,
-            ...(startDate ? { course_start_date: startDate } : {})
-          })
-        });
-      }
-      await call(`/api/teacher/courses/${encodeURIComponent(course.course_code)}/attendance`, token, {
+      setSaving(true);
+      const res = await call(`/api/teacher/courses/${encodeURIComponent(course.course_code)}/attendance`, token, {
         method: 'POST',
         body: JSON.stringify({
           week: numWeek,
@@ -118,103 +166,414 @@ function Attendance({ course, token, notify }) {
         })
       });
       setDirty(false);
+      setIsEditing(false);
       notify(`Attendance saved successfully for Week ${numWeek}, Day ${numDay}.`);
-      await load(numWeek, numDay);
+      if (res && res.sessions && res.students) {
+        applyAttendanceData(res, numWeek, numDay);
+      } else {
+        await load(numWeek, numDay);
+      }
     } catch (e) {
       notify(e.message, 'danger');
+    } finally {
+      setSaving(false);
     }
   };
-  return <>
-    <div className="card mb-3">
-      <div className="card-body row g-3 align-items-end">
-        <div className="col-md-2">
-          <label className="form-label">Week</label>
-          <select className="form-select" value={week} onChange={e => { const v = parseInt(e.target.value, 10) || 1; setWeek(v); }}>
-            {Array.from({ length: 13 }, (_, i) => <option key={i + 1} value={i + 1}>Week {i + 1}</option>)}
-          </select>
+
+  const isAttendanceInteractive = isConfirmed && (!hasSavedAttendance || isEditing);
+
+  return (
+    <div className="attendance-main-flex-wrapper">
+      {/* ── Flexbox Container 1: Quick Attendance ── */}
+      <section className="attendance-flex-container quick-attendance-flexbox">
+        <div className="attendance-flex-header">
+          <div className="attendance-header-info">
+            <h4 className="attendance-header-title">
+              <span className="header-icon">📋</span> Quick Attendance
+            </h4>
+            <p className="attendance-header-sub">
+              Mark session attendance for confirmed classes. Holiday sessions remain inactive and blank.
+            </p>
+          </div>
+          <div className="attendance-header-badges">
+            <span className={`badge px-3 py-2 ${isConfirmed ? 'bg-success-subtle text-success border border-success' : 'bg-secondary-subtle text-secondary border border-secondary'}`}>
+              {isConfirmed ? '✓ Confirmed Session' : '🏖️ Holiday / Not Held'}
+            </span>
+            {isConfirmed && (
+              <span className={`badge px-3 py-2 ${hasSavedAttendance ? 'bg-primary-subtle text-primary border border-primary' : 'bg-warning-subtle text-warning-emphasis border border-warning'}`}>
+                {hasSavedAttendance ? '✓ Attendance Saved' : '⏳ Awaiting Attendance'}
+              </span>
+            )}
+            {dirty && <span className="badge text-bg-warning px-3 py-2">Unsaved Changes</span>}
+          </div>
         </div>
-        <div className="col-md-2">
-          <label className="form-label">Day</label>
-          <select className="form-select" value={day} onChange={e => { const v = parseInt(e.target.value, 10) || 1; setDay(v); }}>
-            {[1, 2, 3].map(n => <option key={n} value={n}>Day {n}</option>)}
-          </select>
+
+        {/* Session Toolbar */}
+        <div className="attendance-session-toolbar">
+          <div className="attendance-session-field">
+            <label>Week</label>
+            <select
+              className="form-select form-select-sm"
+              value={week}
+              onChange={e => {
+                const v = parseInt(e.target.value, 10) || 1;
+                setWeek(v);
+              }}
+            >
+              {Array.from({ length: 13 }, (_, i) => (
+                <option key={i + 1} value={i + 1}>Week {i + 1}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="attendance-session-field">
+            <label>Day</label>
+            <select
+              className="form-select form-select-sm"
+              value={day}
+              onChange={e => {
+                const v = parseInt(e.target.value, 10) || 1;
+                setDay(v);
+              }}
+            >
+              {[1, 2, 3].map(n => (
+                <option key={n} value={n}>Day {n}</option>
+              ))}
+            </select>
+          </div>
+
+          <div className="attendance-session-field" style={{ minWidth: '180px' }}>
+            <label>Actual Class Date</label>
+            <input
+              type="date"
+              className="form-control form-control-sm"
+              value={startDate || session.date || ''}
+              onChange={e => setStartDate(e.target.value)}
+            />
+          </div>
+
+          <div className="attendance-session-actions">
+            <button
+              type="button"
+              className={`btn btn-sm ${isConfirmed ? 'btn-success text-white' : 'btn-outline-success'}`}
+              onClick={() => saveSession(true)}
+              title="Confirm that class was held for this date"
+            >
+              ✓ Confirm Class Held
+            </button>
+            <button
+              type="button"
+              className={`btn btn-sm ${!isConfirmed ? 'btn-secondary text-white' : 'btn-outline-secondary'}`}
+              onClick={() => saveSession(false)}
+              title="Mark this session as holiday (attendance inactive and blank)"
+            >
+              🏖️ Mark Holiday
+            </button>
+          </div>
         </div>
-        <div className="col-md-3">
-          <label className="form-label">Actual class date</label>
-          <input type="date" className="form-control" value={startDate || session.date || ''} onChange={e => setStartDate(e.target.value)} />
-        </div>
-        <div className="col-md-5">
-          <span className={`me-2 badge ${session.class_held ? 'text-bg-success' : 'text-bg-secondary'}`}>
-            {session.class_held ? 'Class held' : 'Not held / holiday'}
-          </span>
-          <button className="btn btn-success btn-sm me-2" onClick={() => saveSession(true)}>Confirm class held</button>
-          <button className="btn btn-outline-secondary btn-sm" onClick={() => saveSession(false)}>Mark holiday</button>
-        </div>
-      </div>
-    </div>
-    <div className="card mb-3">
-      <div className="card-header d-flex justify-content-between">
-        <b>Quick attendance: Week {numWeek}, Day {numDay}</b>
-        {dirty && <span className="text-warning">Unsaved changes</span>}
-      </div>
-      <div className="card-body p-0">
-        <div className="quick-table">
-          <table className="table table-hover mb-0">
-            <thead>
-              <tr>
-                <th style={{ width: '40px' }}>Select</th>
-                <th>Roll</th>
-                <th>Name</th>
-                <th>Attendance Status</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(data.students || []).map(s => {
-                const isAbsent = entries[s.roll] === 'Absent';
-                const toggle = () => {
-                  setEntries({ ...entries, [s.roll]: isAbsent ? 'Present' : 'Absent' });
+
+        {/* Quick Attendance Interactive Box */}
+        <div className={`quick-attendance-card ${!isConfirmed ? 'holiday-inactive' : ''}`}>
+          <div className="quick-attendance-card-header">
+            <div>
+              <strong>Quick Attendance: Week {numWeek}, Day {numDay}</strong>
+              <small className="text-muted ms-2">({session.date || 'No Date Specified'})</small>
+            </div>
+            <div>
+              {!isConfirmed ? (
+                <span className="badge text-bg-secondary">Inactive (Holiday)</span>
+              ) : hasSavedAttendance && !isEditing ? (
+                <span className="badge text-bg-success">Saved in Database</span>
+              ) : isEditing ? (
+                <span className="badge text-bg-warning">Authorized Edit Mode</span>
+              ) : (
+                <span className="badge text-bg-primary">Ready to Mark</span>
+              )}
+            </div>
+          </div>
+
+          {/* Contextual Status Alerts */}
+          {!isConfirmed && (
+            <div className="alert alert-secondary d-flex align-items-center gap-2 m-3 mb-0 py-2">
+              <span style={{ fontSize: '1.2rem' }}>🏖️</span>
+              <div>
+                <strong>Holiday Session:</strong> Quick Attendance is inactive. Attendance records remain blank, no student is marked Present or Absent, and submission is disabled.
+              </div>
+            </div>
+          )}
+
+          {isConfirmed && hasSavedAttendance && !isEditing && (
+            <div className="alert alert-success d-flex flex-wrap align-items-center justify-content-between gap-2 m-3 mb-0 py-2">
+              <div className="d-flex align-items-center gap-2">
+                <span style={{ fontSize: '1.2rem' }}>✓</span>
+                <div>
+                  <strong>Attendance Saved:</strong> Attendance records have been saved for this session. Save Attendance is disabled to prevent duplicate submissions.
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-sm btn-outline-warning text-dark fw-bold"
+                onClick={() => setIsEditing(true)}
+              >
+                ✏️ Modify Attendance
+              </button>
+            </div>
+          )}
+
+          {isConfirmed && isEditing && (
+            <div className="alert alert-warning d-flex flex-wrap align-items-center justify-content-between gap-2 m-3 mb-0 py-2">
+              <div className="d-flex align-items-center gap-2">
+                <span style={{ fontSize: '1.2rem' }}>✏️</span>
+                <div>
+                  <strong>Authorized Editing in Progress:</strong> Modify student attendance below and click <b>Update Attendance</b> to save changes.
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-sm btn-outline-secondary"
+                onClick={() => {
+                  const key = `w${numWeek}d${numDay}`;
+                  setEntries(Object.fromEntries((data.students || []).map(s => [s.roll, s.attendance?.[key] || 'Present'])));
+                  setDirty(false);
+                  setIsEditing(false);
+                }}
+              >
+                Cancel Edit
+              </button>
+            </div>
+          )}
+
+          {/* Quick Table */}
+          <div className="quick-table-scroll mt-2">
+            <table className="table table-hover align-middle mb-0">
+              <thead>
+                <tr>
+                  <th style={{ width: '50px', textAlign: 'center' }}>Select</th>
+                  <th style={{ width: '120px' }}>Roll</th>
+                  <th>Name</th>
+                  <th style={{ width: '180px' }}>Attendance Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(data.students || []).map(s => {
+                  if (!isConfirmed) {
+                    // Holiday session: records remain blank, no student Present or Absent
+                    return (
+                      <tr key={s.roll} className="text-muted" style={{ opacity: 0.65 }}>
+                        <td style={{ textAlign: 'center' }}>
+                          <input
+                            type="checkbox"
+                            className="form-check-input"
+                            disabled
+                            checked={false}
+                          />
+                        </td>
+                        <td>{s.roll}</td>
+                        <td>{s.name}</td>
+                        <td>
+                          <span className="badge bg-light text-muted border px-2 py-1">
+                            — Blank (Holiday)
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  }
+
+                  const status = entries[s.roll] || 'Present';
+                  const isAbsent = status === 'Absent';
+
+                  const toggle = () => {
+                    if (!isAttendanceInteractive) return;
+                    setEntries({ ...entries, [s.roll]: isAbsent ? 'Present' : 'Absent' });
+                    setDirty(true);
+                  };
+
+                  return (
+                    <tr
+                      key={s.roll}
+                      className={isAbsent ? 'table-danger' : ''}
+                      onClick={toggle}
+                      style={{
+                        cursor: isAttendanceInteractive ? 'pointer' : 'default',
+                        userSelect: 'none'
+                      }}
+                    >
+                      <td style={{ textAlign: 'center' }}>
+                        <input
+                          type="checkbox"
+                          className="form-check-input"
+                          disabled={!isAttendanceInteractive}
+                          checked={isAbsent}
+                          onChange={toggle}
+                          onClick={e => e.stopPropagation()}
+                        />
+                      </td>
+                      <td><b>{s.roll}</b></td>
+                      <td>{s.name}</td>
+                      <td>
+                        <span className={`badge ${isAbsent ? 'text-bg-danger' : 'text-bg-success'} px-2 py-1`}>
+                          {isAbsent ? 'Absent (A)' : 'Present (P)'}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Action Bar */}
+          <div className="quick-actions-bar">
+            <div className="d-flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="btn btn-outline-primary btn-sm"
+                disabled={!isAttendanceInteractive}
+                onClick={() => {
+                  setEntries(Object.fromEntries((data.students || []).map(s => [s.roll, 'Present'])));
                   setDirty(true);
-                };
-                return (
-                  <tr
-                    key={s.roll}
-                    className={isAbsent ? 'table-danger' : ''}
-                    onClick={toggle}
-                    style={{ cursor: 'pointer', userSelect: 'none' }}
-                  >
-                    <td>
-                      <input
-                        type="checkbox"
-                        className="form-check-input"
-                        checked={isAbsent}
-                        onChange={toggle}
-                        onClick={e => e.stopPropagation()}
-                      />
-                    </td>
-                    <td>{s.roll}</td>
-                    <td>{s.name}</td>
-                    <td>
-                      <span className={`badge ${isAbsent ? 'text-bg-danger' : 'text-bg-success'}`}>
-                        {isAbsent ? 'Absent (A)' : 'Present (P)'}
-                      </span>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+                }}
+              >
+                Clear selections (All Present)
+              </button>
+              <button
+                type="button"
+                className="btn btn-outline-secondary btn-sm"
+                disabled={!isAttendanceInteractive}
+                onClick={() => {
+                  setEntries(Object.fromEntries((data.students || []).map(s => [s.roll, 'Absent'])));
+                  setDirty(true);
+                }}
+              >
+                Select all (Mark Absent)
+              </button>
+              {isConfirmed && hasSavedAttendance && !isEditing && (
+                <button
+                  type="button"
+                  className="btn btn-outline-warning btn-sm text-dark fw-bold"
+                  onClick={() => setIsEditing(true)}
+                >
+                  ✏️ Modify Attendance
+                </button>
+              )}
+            </div>
+
+            <div>
+              {!isConfirmed ? (
+                <button type="button" className="btn btn-secondary btn-sm px-4" disabled>
+                  Save Attendance (Disabled on Holiday)
+                </button>
+              ) : hasSavedAttendance && !isEditing ? (
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm px-4"
+                  disabled
+                  title="Attendance already saved for this session. Use 'Modify Attendance' to edit."
+                >
+                  ✓ Attendance Saved
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm px-4"
+                  disabled={saving}
+                  onClick={saveAttendance}
+                >
+                  {saving ? 'Saving...' : isEditing ? '💾 Update Attendance' : '💾 Save Attendance'}
+                </button>
+              )}
+            </div>
+          </div>
         </div>
-        <div className="p-3">
-          <button className="btn btn-outline-primary me-2" onClick={() => { setEntries(Object.fromEntries((data.students || []).map(s => [s.roll, 'Present']))); setDirty(true); }}>Clear selections (All Present)</button>
-          <button className="btn btn-outline-secondary me-2" onClick={() => { setEntries(Object.fromEntries((data.students || []).map(s => [s.roll, 'Absent']))); setDirty(true); }}>Select all (Mark Absent)</button>
-          <button className="btn btn-primary" onClick={saveAttendance}>Save attendance</button>
+      </section>
+
+      {/* ── Flexbox Container 2: Attendance Record ── */}
+      <section className="attendance-flex-container attendance-record-flexbox">
+        <div className="attendance-flex-header">
+          <div className="attendance-header-info">
+            <h4 className="attendance-header-title">
+              <span className="header-icon">📊</span> Attendance Record
+            </h4>
+            <p className="attendance-header-sub">
+              Official 13-week semester attendance matrix and continuous evaluation percentage.
+            </p>
+          </div>
+          <div className="attendance-header-badges">
+            <span className="badge bg-success-subtle text-success border border-success px-2 py-1">P = Present</span>
+            <span className="badge bg-danger-subtle text-danger border border-danger px-2 py-1">A = Absent</span>
+            <span className="badge bg-light text-muted border px-2 py-1">Blank = Holiday / Not Held</span>
+          </div>
         </div>
+
+        <Spreadsheet students={data.students} />
+      </section>
+    </div>
+  );
+}
+
+function Spreadsheet({ students }) {
+  const heldCount = (students && students[0]?.total_held) ?? 0;
+  return (
+    <div className="card shadow-sm border-0">
+      <div className="card-header bg-light d-flex flex-wrap justify-content-between align-items-center py-2 px-3 border-bottom">
+        <div>
+          <b>13-Week Attendance Spreadsheet</b>
+          <small className="ms-2 text-muted">Only confirmed class sessions count in percentages and continuous assessment marks.</small>
+        </div>
+        <span className="badge bg-primary-subtle text-primary border border-primary">
+          {heldCount} Classes Held to Date
+        </span>
+      </div>
+      <div className="sheet">
+        <table className="table table-bordered table-sm mb-0">
+          <thead>
+            <tr>
+              <th rowSpan="2" className="sticky-roll">Roll</th>
+              <th rowSpan="2" className="sticky-name">Name</th>
+              {Array.from({ length: 13 }, (_, i) => (
+                <th colSpan="3" key={i} className="text-center">Week {i + 1}</th>
+              ))}
+              <th rowSpan="2">Present</th>
+              <th rowSpan="2">Absent</th>
+              <th rowSpan="2">Attendance %</th>
+              <th rowSpan="2">Att Marks</th>
+            </tr>
+            <tr>
+              {Array.from({ length: 39 }, (_, i) => (
+                <th key={i}>D{(i % 3) + 1}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {(students || []).map(s => (
+              <tr key={s.roll}>
+                <td className="sticky-roll">{s.roll}</td>
+                <td className="sticky-name">{s.name}</td>
+                {Array.from({ length: 39 }, (_, i) => {
+                  const w = Math.floor(i / 3) + 1;
+                  const d = (i % 3) + 1;
+                  const val = s.attendance?.[`w${w}d${d}`];
+                  return (
+                    <td
+                      key={i}
+                      className={val === 'Present' ? 'present' : val === 'Absent' ? 'absent' : ''}
+                    >
+                      {val === 'Present' ? 'P' : val === 'Absent' ? 'A' : ''}
+                    </td>
+                  );
+                })}
+                <td>{s.present}</td>
+                <td>{s.absent}</td>
+                <td><Status value={s.attendance_status} /> {s.attendance_percentage}%</td>
+                <td><b>{s.attendance_marks ?? 0}/10</b></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       </div>
     </div>
-    <Spreadsheet students={data.students} />
-  </>;
+  );
 }
-function Spreadsheet({ students }) { return <div className="card"><div className="card-header"><b>13-week attendance spreadsheet</b><small className="ms-2 text-muted">Only confirmed class sessions count in percentages.</small></div><div className="sheet"><table className="table table-bordered table-sm mb-0"><thead><tr><th rowSpan="2" className="sticky-roll">Roll</th><th rowSpan="2" className="sticky-name">Name</th>{Array.from({length:13},(_,i)=><th colSpan="3" key={i}>Week {i+1}</th>)}<th rowSpan="2">Present</th><th rowSpan="2">Absent</th><th rowSpan="2">Attendance %</th><th rowSpan="2">Att Marks</th></tr><tr>{Array.from({length:39},(_,i)=><th key={i}>D{(i%3)+1}</th>)}</tr></thead><tbody>{(students || []).map(s=><tr key={s.roll}><td className="sticky-roll">{s.roll}</td><td className="sticky-name">{s.name}</td>{Array.from({length:39},(_,i)=><td key={i} className={s.attendance?.[`w${Math.floor(i/3)+1}d${(i%3)+1}`] === 'Present' ? 'present' : s.attendance?.[`w${Math.floor(i/3)+1}d${(i%3)+1}`] === 'Absent' ? 'absent' : ''}>{s.attendance?.[`w${Math.floor(i/3)+1}d${(i%3)+1}`] === 'Present' ? 'P' : s.attendance?.[`w${Math.floor(i/3)+1}d${(i%3)+1}`] === 'Absent' ? 'A' : ''}</td>)}<td>{s.present}</td><td>{s.absent}</td><td><Status value={s.attendance_status} /> {s.attendance_percentage}%</td><td><b>{s.attendance_marks ?? 0}/10</b></td></tr>)}</tbody></table></div></div> }
 
 function ClassTests({ course, token, notify }) {
   const [rows, setRows] = useState([]);

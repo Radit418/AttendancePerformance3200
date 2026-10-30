@@ -16,6 +16,7 @@ from reportlab.lib.pagesizes import landscape, A3, A4
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
+from pymongo import UpdateOne
 import database
 
 app = Flask(__name__)
@@ -160,15 +161,19 @@ def get_attendance_marks(pct):
     elif pct >= 60: return 4
     else: return 0
 
-def attendance_summary(course):
-    held = {(row["week"], row["day"]): row for row in slots(course) if row.get("class_held")}
-    stored = {(row["roll"], row["week"], row["day"]): row.get("status") for row in database.attendance.find({"course_id": course["course_id"]}) if "roll" in row and "week" in row and "day" in row}
+def attendance_summary(course, course_slots=None, course_students=None):
+    if course_slots is None:
+        course_slots = slots(course)
+    held = {(row["week"], row["day"]): row for row in course_slots if row.get("class_held")}
+    stored = {(row["roll"], row["week"], row["day"]): row.get("status") for row in database.attendance.find({"course_id": course["course_id"]}, {"roll": 1, "week": 1, "day": 1, "status": 1, "_id": 0}) if "roll" in row and "week" in row and "day" in row}
     rows = []
-    for student in students_for(course):
+    if course_students is None:
+        course_students = students_for(course)
+    for student in course_students:
         present = sum(stored.get((student["roll"], week, day)) == "Present" for week, day in held)
         total = len(held); pct = round(present * 100 / total, 2) if total else 0
         att_marks = get_attendance_marks(pct)
-        cells = {f"w{week}d{day}": stored.get((student["roll"], week, day), "") for week in range(1, 14) for day in range(1, 4)}
+        cells = {f"w{week}d{day}": (stored.get((student["roll"], week, day), "") if (week, day) in held else "") for week in range(1, 14) for day in range(1, 4)}
         rows.append({**student, "attendance": cells, "total_held": total, "present": present, "absent": total-present, "attendance_percentage": pct, "attendance_marks": att_marks, "attendance_status": "Good" if pct >= 80 else "Warning" if pct >= 70 else "Critical"})
     return rows
 def test_summary(course):
@@ -739,6 +744,8 @@ def sessions(course_code):
     session = next(row for row in slots(course) if row["week"] == week and row["day"] == day)
     session.update({"date": payload.get("date", session["date"]), "class_held": bool(payload.get("class_held")), "teacher_id": request.teacher_id})
     database.class_sessions.update_one({"course_id": course["course_id"], "week": week, "day": day}, {"$set": session}, upsert=True)
+    if not session["class_held"]:
+        database.attendance.delete_many({"course_id": course["course_id"], "week": week, "day": day})
     if payload.get("course_start_date"): database.courses.update_one({"course_id": course["course_id"]}, {"$set": {"course_start_date": payload["course_start_date"]}})
     return jsonify({"session": session})
 
@@ -747,23 +754,27 @@ def sessions(course_code):
 def attendance(course_code):
     course, response = owned_course(course_code)
     if response: return response
-    if request.method == "GET": return jsonify({"sessions": slots(course), "students": attendance_summary(course)})
+    if request.method == "GET":
+        course_slots = slots(course)
+        return jsonify({"sessions": course_slots, "students": attendance_summary(course, course_slots=course_slots)})
     payload = request.get_json(silent=True) or {}; week, day, entries = payload.get("week"), payload.get("day"), payload.get("entries")
     session = database.class_sessions.find_one({"course_id": course["course_id"], "week": week, "day": day})
     if not session or not session.get("class_held"):
-        slot = next((row for row in slots(course) if row["week"] == week and row["day"] == day), None)
-        slot_date = (session or {}).get("date") or (slot["date"] if slot else date.today().isoformat())
-        session_doc = {"course_id": course["course_id"], "course_code": course["course_code"], "series": course["series"], "semester": course["semester"], "week": week, "day": day, "date": slot_date, "class_held": True, "teacher_id": request.teacher_id}
-        database.class_sessions.update_one({"course_id": course["course_id"], "week": week, "day": day}, {"$set": session_doc}, upsert=True)
-        session = session_doc
-    students = {row["roll"]: row for row in students_for(course)}
+        return error("Attendance cannot be submitted for a holiday or unconfirmed session", 400)
+    enrolled_students = students_for(course)
+    students = {row["roll"]: row for row in enrolled_students}
     if not isinstance(entries, list) or len(entries) != len(students): return error("Attendance needs one entry for every enrolled student")
+    operations = []
     for entry in entries:
         roll, status = entry.get("roll"), entry.get("status")
         if roll not in students or status not in ("Present", "Absent"): return error("Use Present or Absent for enrolled students only")
         row = {"student_id": students[roll].get("student_id", roll), "roll": roll, "course_id": course["course_id"], "course_code": course["course_code"], "series": course["series"], "semester": course["semester"], "week": week, "day": day, "date": session["date"], "status": status}
-        database.attendance.update_one({"course_id": course["course_id"], "roll": roll, "week": week, "day": day}, {"$set": row}, upsert=True)
-    return jsonify({"saved": len(entries)})
+        operations.append(UpdateOne({"course_id": course["course_id"], "roll": roll, "week": week, "day": day}, {"$set": row}, upsert=True))
+    if operations:
+        database.attendance.bulk_write(operations, ordered=False)
+    course_slots = slots(course)
+    summary = attendance_summary(course, course_slots=course_slots, course_students=enrolled_students)
+    return jsonify({"saved": len(entries), "sessions": course_slots, "students": summary})
 
 @app.route("/api/teacher/courses/<path:course_code>/class-tests", methods=["GET", "POST"])
 @require_teacher
@@ -774,6 +785,7 @@ def class_tests(course_code):
     payload = request.get_json(silent=True) or {}; results, total = payload.get("results"), payload.get("total_marks", 20)
     if not isinstance(results, list): return error("Provide results list")
     enrolled_rolls = {str(row["roll"]) for row in students_for(course)}
+    operations = []
     saved_count = 0
     for item in results:
         if not isinstance(item, dict): continue
@@ -801,8 +813,10 @@ def class_tests(course_code):
                 mark_val = int(mark) if float(mark).is_integer() else float(mark)
         if mark_val is not None:
             row = {"student_id": roll, "roll": roll, "course_id": course["course_id"], "course_code": course["course_code"], "series": course["series"], "semester": course["semester"], "test_number": number, "obtained_marks": mark_val, "total_marks": total}
-            database.class_test_results.update_one({"course_id": course["course_id"], "roll": roll, "test_number": number}, {"$set": row}, upsert=True)
+            operations.append(UpdateOne({"course_id": course["course_id"], "roll": roll, "test_number": number}, {"$set": row}, upsert=True))
             saved_count += 1
+    if operations:
+        database.class_test_results.bulk_write(operations, ordered=False)
     return jsonify({"saved": saved_count})
 
 @app.route("/api/teacher/courses/<path:course_code>/assignments", methods=["GET", "POST"])

@@ -31,6 +31,16 @@ class UpdateResult:
         self.matched_count, self.modified_count, self.upserted_id = matched_count, modified_count, upserted_id
 
 
+class BulkWriteResult:
+    def __init__(self, inserted_count=0, matched_count=0, modified_count=0, deleted_count=0, upserted_count=0, upserted_ids=None):
+        self.inserted_count = inserted_count
+        self.matched_count = matched_count
+        self.modified_count = modified_count
+        self.deleted_count = deleted_count
+        self.upserted_count = upserted_count
+        self.upserted_ids = upserted_ids or {}
+
+
 class InMemoryCollection:
     """Subset of PyMongo used by the application, for offline local development."""
     def __init__(self):
@@ -94,6 +104,39 @@ class InMemoryCollection:
             if self._matches(row, query):
                 row.update(deepcopy(update.get("$set", {}))); count += 1
         return UpdateResult(count, count)
+
+    def create_index(self, keys, **kwargs):
+        pass
+
+    def list_indexes(self):
+        return []
+
+    def bulk_write(self, requests, ordered=True):
+        matched_count = 0
+        modified_count = 0
+        upserted_count = 0
+        deleted_count = 0
+        inserted_count = 0
+        for req in requests:
+            if hasattr(req, "_filter") and hasattr(req, "_doc"):
+                res = self.update_one(req._filter, req._doc, upsert=bool(getattr(req, "_upsert", False)))
+                matched_count += res.matched_count
+                modified_count += res.modified_count
+                if res.upserted_id:
+                    upserted_count += 1
+            elif hasattr(req, "_doc"):
+                self.insert_one(req._doc)
+                inserted_count += 1
+            elif hasattr(req, "_filter"):
+                res = self.delete_one(req._filter)
+                deleted_count += res.deleted_count
+        return BulkWriteResult(
+            inserted_count=inserted_count,
+            matched_count=matched_count,
+            modified_count=modified_count,
+            deleted_count=deleted_count,
+            upserted_count=upserted_count,
+        )
 
 
 using_in_memory_database = False
@@ -160,10 +203,51 @@ def ensure_student_assignments():
 
 
 def ensure_indexes():
-    """Create safe uniqueness protections when connected to MongoDB."""
+    """Create safe uniqueness protections and performance indexes when connected to MongoDB."""
     if using_in_memory_database:
         return
-    assignment_submissions.create_index([("assignment_id", 1), ("student_id", 1)], unique=True, name="unique_student_assignment_submission")
+    try:
+        assignment_submissions.create_index([("assignment_id", 1), ("student_id", 1)], unique=True, name="unique_student_assignment_submission")
+    except Exception: pass
+    try:
+        attendance.create_index([("course_id", 1), ("roll", 1), ("week", 1), ("day", 1)], unique=True, name="unique_attendance_entry")
+    except Exception: pass
+    try:
+        attendance.create_index([("course_id", 1)], name="idx_attendance_course")
+    except Exception: pass
+    try:
+        attendance.create_index([("student_id", 1)], name="idx_attendance_student")
+    except Exception: pass
+    try:
+        class_sessions.create_index([("course_id", 1), ("week", 1), ("day", 1)], unique=True, name="unique_class_session")
+    except Exception: pass
+    try:
+        class_sessions.create_index([("course_id", 1)], name="idx_class_sessions_course")
+    except Exception: pass
+    try:
+        enrollments.create_index([("course_id", 1), ("roll", 1)], unique=True, name="unique_course_enrollment")
+    except Exception: pass
+    try:
+        enrollments.create_index([("course_id", 1)], name="idx_enrollments_course")
+    except Exception: pass
+    try:
+        students.create_index([("roll", 1)], unique=True, name="unique_student_roll")
+    except Exception: pass
+    try:
+        students.create_index([("student_id", 1)], unique=True, name="unique_student_id")
+    except Exception: pass
+    try:
+        courses.create_index([("course_id", 1)], unique=True, name="unique_course_id")
+    except Exception: pass
+    try:
+        courses.create_index([("course_code", 1)], name="idx_course_code")
+    except Exception: pass
+    try:
+        class_test_results.create_index([("course_id", 1), ("roll", 1), ("test_number", 1)], unique=True, name="unique_class_test_result")
+    except Exception: pass
+    try:
+        class_test_results.create_index([("course_id", 1)], name="idx_class_tests_course")
+    except Exception: pass
 
 
 def seed_development_data():
@@ -190,3 +274,4 @@ def seed_development_data():
 
 
 seed_development_data()
+ensure_indexes()
