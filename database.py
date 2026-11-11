@@ -4,6 +4,7 @@ from datetime import date, timedelta
 import os
 
 from dotenv import load_dotenv
+from gridfs import GridFSBucket
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from werkzeug.security import generate_password_hash
@@ -77,9 +78,14 @@ class InMemoryCollection:
         for row in self.documents:
             if self._matches(row, query):
                 row.update(deepcopy(update.get("$set", {})))
+                for key in update.get("$unset", {}):
+                    row.pop(key, None)
                 return UpdateResult(1, 1)
         if upsert:
-            row = deepcopy(query); row.update(deepcopy(update.get("$setOnInsert", {}))); row.update(deepcopy(update.get("$set", {}))); self.documents.append(row)
+            row = deepcopy(query); row.update(deepcopy(update.get("$setOnInsert", {}))); row.update(deepcopy(update.get("$set", {})))
+            for key in update.get("$unset", {}):
+                row.pop(key, None)
+            self.documents.append(row)
             return UpdateResult(0, 0, True)
         return UpdateResult()
 
@@ -143,14 +149,22 @@ using_in_memory_database = False
 MONGO_URI = os.getenv("MONGO_URI")
 try:
     if not MONGO_URI: raise ValueError("MONGO_URI is missing")
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+    client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=10000,
+        connectTimeoutMS=10000,
+        socketTimeoutMS=30000,
+        retryReads=True,
+    )
     client.admin.command("ping")
     db = client["smart_attendance_system"]
     collections = {name: db[name] for name in COLLECTION_NAMES}
+    assignment_files = GridFSBucket(db, bucket_name="assignment_files")
     print("MongoDB connected successfully")
 except (PyMongoError, ValueError) as error:
     using_in_memory_database = True
     collections = {name: InMemoryCollection() for name in COLLECTION_NAMES}
+    assignment_files = None
     print(f"MongoDB unavailable; using temporary development data ({error})")
 globals().update(collections)
 

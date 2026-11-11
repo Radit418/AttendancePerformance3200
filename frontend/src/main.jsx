@@ -24,18 +24,124 @@ const submitForm = async (path, token, form) => {
  * Fetches a file via the API (with Bearer auth) and opens it as a blob:// URL
  * in a new browser tab. blob:// URLs are NOT intercepted by IDM / download managers.
  */
-const viewFileInBrowser = async (url) => {
+const fileViewCache = new Map();
+const pendingFileViews = new Map();
+const FILE_VIEW_CACHE_LIMIT = 3;
+const FILE_VIEW_CACHE_MS = 30000;
+const FILE_FETCH_ATTEMPTS = 3;
+const FILE_FETCH_TIMEOUT_MS = 60000;
+
+const cacheFileView = (url, blobUrl) => {
+  const entry = { blobUrl, timer: null };
+  const expire = () => {
+    if (fileViewCache.get(url) !== entry) return;
+    fileViewCache.delete(url);
+    URL.revokeObjectURL(blobUrl);
+  };
+  entry.timer = window.setTimeout(expire, FILE_VIEW_CACHE_MS);
+  fileViewCache.set(url, entry);
+  while (fileViewCache.size > FILE_VIEW_CACHE_LIMIT) {
+    const [oldestUrl, oldestEntry] = fileViewCache.entries().next().value;
+    window.clearTimeout(oldestEntry.timer);
+    URL.revokeObjectURL(oldestEntry.blobUrl);
+    fileViewCache.delete(oldestUrl);
+  }
+};
+
+const fetchFileBlob = async url => {
+  for (let attempt = 0; attempt < FILE_FETCH_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), FILE_FETCH_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, {
+        cache: 'no-store',
+        credentials: 'omit',
+        redirect: 'error',
+        signal: controller.signal
+      });
+      if (response.status === 401) throw new Error('Your session has expired. Sign in again to view this file.');
+      if (response.status === 403) throw new Error('You are not authorized to view this file.');
+      if (response.status === 404) throw new Error('This file is no longer available.');
+      if (!response.ok) {
+        if (response.status < 500 && response.status !== 429) {
+          throw new Error(`The file service returned an error (${response.status}).`);
+        }
+        throw new Error('The file service is temporarily unavailable.');
+      }
+      return await response.blob();
+    } catch (error) {
+      const retryable = error.name === 'TypeError'
+        || error.name === 'AbortError'
+        || error.message === 'The file service is temporarily unavailable.';
+      if (!retryable || attempt === FILE_FETCH_ATTEMPTS - 1) {
+        if (error.name === 'AbortError') {
+          throw new Error('The file request timed out. Please check your connection and try again.');
+        }
+        if (error.name === 'TypeError') {
+          throw new Error('Could not reach the file service. Check your connection and try again.');
+        }
+        throw error;
+      }
+    } finally {
+      window.clearTimeout(timeout);
+    }
+    await new Promise(resolve => window.setTimeout(resolve, 300 * (attempt + 1)));
+  }
+  throw new Error('Could not reach the file service. Check your connection and try again.');
+};
+
+const getFileBlobUrl = url => {
+  const cached = fileViewCache.get(url);
+  if (cached) {
+    window.clearTimeout(cached.timer);
+    fileViewCache.delete(url);
+    cacheFileView(url, cached.blobUrl);
+    return Promise.resolve(cached.blobUrl);
+  }
+  const pending = pendingFileViews.get(url);
+  if (pending) return pending;
+
+  const request = fetchFileBlob(url)
+    .then(blob => {
+      const blobUrl = URL.createObjectURL(blob);
+      cacheFileView(url, blobUrl);
+      return blobUrl;
+    })
+    .finally(() => pendingFileViews.delete(url));
+  pendingFileViews.set(url, request);
+  return request;
+};
+
+const viewFileInBrowser = async (url, button) => {
+  if (pendingFileViews.has(url)) return;
+  const tab = window.open('about:blank', '_blank');
+  if (!tab) {
+    alert('Please allow popups for this site to view files online.');
+    return;
+  }
+  tab.opener = null;
+  tab.document.title = 'Loading file';
+  tab.document.body.textContent = 'Loading file…';
+  const buttonContent = button?.innerHTML;
+  if (button) {
+    button.disabled = true;
+    button.setAttribute('aria-busy', 'true');
+    button.textContent = 'Loading…';
+  }
   try {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Failed to load file (${response.status})`);
-    const blob = await response.blob();
-    const blobUrl = URL.createObjectURL(blob);
-    const win = window.open(blobUrl, '_blank', 'noopener,noreferrer');
-    // Revoke after 60 s so memory is freed
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
-    if (!win) alert('Please allow popups for this site to view files online.');
+    const blobUrl = await getFileBlobUrl(url);
+    if (!tab.closed) tab.location.replace(blobUrl);
   } catch (err) {
-    alert(`Could not open file: ${err.message}`);
+    if (!tab.closed) {
+      tab.close();
+      alert(`Could not open file: ${err.message}`);
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.removeAttribute('aria-busy');
+      button.innerHTML = buttonContent;
+    }
   }
 };
 const Status = ({ value }) => <span className={`badge ${value === 'Good' || value === 'Low' ? 'text-bg-success' : value === 'Warning' || value === 'Medium' ? 'text-bg-warning' : 'text-bg-danger'}`}>{value}</span>;
@@ -919,7 +1025,7 @@ function Assignments({ course, token, notify }) {
   };
 
   const unsubmitTeacherFile = async () => {
-    if (!selectedAssignment || !selectedAssignment.ref_file_name) return;
+    if (!selectedAssignment || !selectedAssignment.ref_file_id) return;
     if (!window.confirm(`Are you sure you want to unsubmit / remove the file for Assignment ${selectedAssignment.assignment_number}? You can upload a new file if you mistakenly uploaded this one.`)) return;
     try {
       const res = await call(
@@ -970,8 +1076,8 @@ function Assignments({ course, token, notify }) {
     }
   };
 
-  const getFileUrl = (filename, isDownload = false) =>
-    `${API}/api/assignments/files/${encodeURIComponent(filename)}?token=${encodeURIComponent(token)}${isDownload ? '&download=1' : ''}`;
+  const getFileUrl = (fileId, isDownload = false) =>
+    `${API}/api/assignments/files/${encodeURIComponent(fileId)}?token=${encodeURIComponent(token)}${isDownload ? '&download=1' : ''}`;
 
   return (
     <>
@@ -1053,18 +1159,18 @@ function Assignments({ course, token, notify }) {
                     <span className="ms-3">Total Marks: <b>{selectedAssignment.total_marks}</b></span>
                   </div>
                 </div>
-                {selectedAssignment.ref_file_name ? (
+                {selectedAssignment.ref_file_id ? (
                   <div className="d-flex flex-column align-items-end gap-2">
                     <div className="d-flex gap-2 align-items-center flex-wrap">
                       <button
                         type="button"
                         className="btn btn-outline-primary btn-sm"
-                        onClick={() => viewFileInBrowser(getFileUrl(selectedAssignment.ref_file_name, false))}
+                        onClick={event => viewFileInBrowser(getFileUrl(selectedAssignment.ref_file_id, false), event.currentTarget)}
                       >
                         👁️ View Online
                       </button>
                       <a
-                        href={getFileUrl(selectedAssignment.ref_file_name, true)}
+                        href={getFileUrl(selectedAssignment.ref_file_id, true)}
                         className="btn btn-outline-secondary btn-sm"
                         download
                       >
@@ -1144,17 +1250,17 @@ function Assignments({ course, token, notify }) {
                                 💬 {sub.text_answer}
                               </div>
                             )}
-                            {sub.file_name ? (
+                            {sub.file_id ? (
                               <div className="d-flex gap-1 flex-wrap align-items-center">
                                 <button
                                   type="button"
                                   className="btn btn-sm btn-outline-primary py-0 px-2"
-                                  onClick={() => viewFileInBrowser(getFileUrl(sub.file_name, false))}
+                                  onClick={event => viewFileInBrowser(getFileUrl(sub.file_id, false), event.currentTarget)}
                                 >
                                   👁️ View Online
                                 </button>
                                 <a
-                                  href={getFileUrl(sub.file_name, true)}
+                                  href={getFileUrl(sub.file_id, true)}
                                   className="btn btn-sm btn-outline-secondary py-0 px-2"
                                   download
                                 >
@@ -1569,11 +1675,11 @@ function StudentDashboard({auth,logout}){
                 {a.description&&<p className="cd-asgn-desc">{a.description}</p>}
 
                 {/* Reference file */}
-                {a.ref_file_name&&(
+                {a.ref_file_id&&(
                   <div className="cd-asgn-ref-files">
                     <span className="cd-ref-label">📎 Reference File:</span>
-                    <button type="button" className="cd-file-btn cd-file-btn-view" onClick={()=>viewFileInBrowser(`${API}/api/assignments/files/${encodeURIComponent(a.ref_file_name)}?token=${encodeURIComponent(auth.token)}`)}>👁️ View Online</button>
-                    <a href={`${API}/api/assignments/files/${encodeURIComponent(a.ref_file_name)}?token=${encodeURIComponent(auth.token)}&download=1`} download className="cd-file-btn cd-file-btn-dl">📥 Download</a>
+                    <button type="button" className="cd-file-btn cd-file-btn-view" onClick={event=>viewFileInBrowser(`${API}/api/assignments/files/${encodeURIComponent(a.ref_file_id)}?token=${encodeURIComponent(auth.token)}`,event.currentTarget)}>👁️ View Online</button>
+                    <a href={`${API}/api/assignments/files/${encodeURIComponent(a.ref_file_id)}?token=${encodeURIComponent(auth.token)}&download=1`} download className="cd-file-btn cd-file-btn-dl">📥 Download</a>
                   </div>
                 )}
 
@@ -1594,10 +1700,11 @@ function StudentDashboard({auth,logout}){
                   </div>
                 )}
 
-                {a.file_name&&(
+                {a.file_id&&(
                   <div className="cd-asgn-ref-files mt-2">
                     <span className="cd-ref-label">📁 Your Submitted File:</span>
-                    <button type="button" className="cd-file-btn cd-file-btn-view" onClick={()=>viewFileInBrowser(`${API}/api/assignments/files/${encodeURIComponent(a.file_name)}?token=${encodeURIComponent(auth.token)}`)}>📄 View File</button>
+                    <button type="button" className="cd-file-btn cd-file-btn-view" onClick={event=>viewFileInBrowser(`${API}/api/assignments/files/${encodeURIComponent(a.file_id)}?token=${encodeURIComponent(auth.token)}`,event.currentTarget)}>📄 View File</button>
+                    <a href={`${API}/api/assignments/files/${encodeURIComponent(a.file_id)}?token=${encodeURIComponent(auth.token)}&download=1`} download className="cd-file-btn cd-file-btn-dl">📥 Download</a>
                   </div>
                 )}
 
@@ -2796,4 +2903,3 @@ class ErrorBoundary extends React.Component {
   }
 }
 createRoot(document.getElementById('root')).render(<ErrorBoundary><App/></ErrorBoundary>);
-

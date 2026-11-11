@@ -2,10 +2,17 @@
 from datetime import date, datetime, timedelta
 from functools import wraps
 from io import BytesIO
+import mimetypes
 import os
 import math
+import re
+import time
 from uuid import uuid4
-from flask import Flask, jsonify, request, send_from_directory
+from bson import ObjectId
+from bson.errors import InvalidId
+from flask import Flask, Response, jsonify, request, stream_with_context
+from gridfs.errors import NoFile
+from pymongo.errors import AutoReconnect, ConnectionFailure, NetworkTimeout, PyMongoError, ServerSelectionTimeoutError
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -21,16 +28,41 @@ import database
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "change-this-development-secret")
-app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
-app.config["UPLOAD_FOLDER"] = os.path.join(os.path.dirname(__file__), "uploads", "assignments")
-CORS(app)
+app.config["MAX_CONTENT_LENGTH"] = 11 * 1024 * 1024
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5173").split(",")
+    if origin.strip()
+]
+cors_origins.append(re.compile(r"^https://[a-z0-9.-]+\.vercel\.app$"))
+CORS(app, resources={r"/api/*": {"origins": cors_origins}})
 serializer = URLSafeTimedSerializer(app.config["SECRET_KEY"])
 ALLOWED_ASSIGNMENT_EXTENSIONS = {"pdf", "doc", "docx", "txt", "ppt", "pptx", "jpg", "jpeg", "png"}
+MAX_ASSIGNMENT_FILE_SIZE = 10 * 1024 * 1024
+ASSIGNMENT_FILE_MIME_TYPES = {
+    "pdf": "application/pdf",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "txt": "text/plain",
+    "ppt": "application/vnd.ms-powerpoint",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+}
+
+
+class FileValidationError(ValueError):
+    pass
+
+
+class FileStorageUnavailable(RuntimeError):
+    pass
 
 def public(doc):
     if not doc: return doc
     doc = dict(doc)
-    for key in ("_id", "password", "password_hash"): doc.pop(key, None)
+    for key in ("_id", "password", "password_hash", "file_path", "ref_file_path"): doc.pop(key, None)
     return doc
 def error(message, status=400): return jsonify({"error": message}), status
 def identity():
@@ -48,53 +80,279 @@ def identity():
         return token
     except (BadSignature, SignatureExpired): return None
 
-@app.get("/api/assignments/files/<path:filename>")
-def download_assignment_file(filename):
+def validate_assignment_upload(upload):
+    filename = secure_filename(upload.filename or "")
+    if not filename:
+        raise FileValidationError("Please select a valid filename.")
+    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if extension not in ALLOWED_ASSIGNMENT_EXTENSIONS:
+        raise FileValidationError(f"Unsupported file type. Allowed: {', '.join(sorted(ALLOWED_ASSIGNMENT_EXTENSIONS))}")
+    content_type = (upload.mimetype or "").lower()
+    expected_type = ASSIGNMENT_FILE_MIME_TYPES[extension]
+    if content_type != expected_type:
+        raise FileValidationError(f"File content type must be {expected_type}.")
+    upload.stream.seek(0, os.SEEK_END)
+    size = upload.stream.tell()
+    upload.stream.seek(0)
+    if size > MAX_ASSIGNMENT_FILE_SIZE:
+        raise FileValidationError("File size exceeds 10 MB limit.")
+    header = upload.stream.read(8192)
+    upload.stream.seek(0)
+    signatures = {
+        "pdf": lambda value: value.startswith(b"%PDF-"),
+        "jpg": lambda value: value.startswith(b"\xff\xd8\xff"),
+        "jpeg": lambda value: value.startswith(b"\xff\xd8\xff"),
+        "png": lambda value: value.startswith(b"\x89PNG\r\n\x1a\n"),
+        "doc": lambda value: value.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),
+        "ppt": lambda value: value.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"),
+        "docx": lambda value: value.startswith(b"PK\x03\x04"),
+        "pptx": lambda value: value.startswith(b"PK\x03\x04"),
+        "txt": lambda value: b"\x00" not in value,
+    }
+    if not signatures[extension](header):
+        raise FileValidationError("File contents do not match the selected file type.")
+    return filename, content_type, size
+
+
+def store_gridfs_stream(stream, filename, size, metadata):
+    bucket = database.assignment_files
+    if bucket is None:
+        raise FileStorageUnavailable("MongoDB GridFS is unavailable; configure MONGO_URI before uploading files.")
+    grid_file = bucket.open_upload_stream(filename, metadata=metadata)
+    try:
+        written = 0
+        while written < size:
+            chunk = stream.read(min(64 * 1024, size - written))
+            if not chunk:
+                raise OSError("File ended before the expected size was read.")
+            grid_file.write(chunk)
+            written += len(chunk)
+        if stream.read(1):
+            raise OSError("File changed while it was being stored.")
+        grid_file.close()
+    except Exception:
+        grid_file.abort()
+        raise
+    return str(grid_file._id)
+
+
+def store_assignment_upload(upload, uploader_id, uploader_role, course_id, assignment_id):
+    filename, content_type, size = validate_assignment_upload(upload)
+    uploaded_at = datetime.utcnow()
+    metadata = {
+        "original_filename": filename,
+        "content_type": content_type,
+        "file_size": size,
+        "uploader_id": uploader_id,
+        "uploader_role": uploader_role,
+        "course_id": course_id,
+        "assignment_id": assignment_id,
+        "uploaded_at": uploaded_at,
+    }
+    file_id = store_gridfs_stream(upload.stream, filename, size, metadata)
+    return {
+        "file_id": file_id,
+        "file_name": filename,
+        "file_content_type": content_type,
+        "file_size": size,
+        "file_uploaded_at": uploaded_at.isoformat(),
+    }
+
+
+def delete_gridfs_file(file_id):
+    if not file_id:
+        return
+    bucket = database.assignment_files
+    if bucket is None:
+        raise FileStorageUnavailable("MongoDB GridFS is unavailable; configure MONGO_URI before deleting files.")
+    try:
+        parsed_id = ObjectId(str(file_id))
+    except (InvalidId, TypeError):
+        app.logger.warning("Skipping invalid GridFS file ID %r", file_id)
+        return
+    try:
+        bucket.delete(parsed_id)
+    except NoFile:
+        app.logger.warning("GridFS file %s was already missing", parsed_id)
+
+
+def open_gridfs_file(file_id, chunk_size=64 * 1024, attempts=3):
+    transient_errors = (AutoReconnect, ConnectionFailure, NetworkTimeout, ServerSelectionTimeoutError)
+    for attempt in range(attempts):
+        grid_file = None
+        try:
+            grid_file = database.assignment_files.open_download_stream(file_id)
+            first_chunk = grid_file.read(chunk_size)
+            return grid_file, first_chunk
+        except NoFile:
+            if grid_file:
+                try:
+                    grid_file.close()
+                except PyMongoError:
+                    app.logger.warning("Failed to close missing GridFS file %s", file_id, exc_info=True)
+            raise
+        except PyMongoError as exc:
+            if grid_file:
+                try:
+                    grid_file.close()
+                except PyMongoError:
+                    app.logger.warning("Failed to close GridFS file after a read error %s", file_id, exc_info=True)
+            retryable = isinstance(exc, transient_errors) or exc.has_error_label("RetryableReadError")
+            if not retryable or attempt == attempts - 1:
+                raise
+            time.sleep(0.15 * (attempt + 1))
+
+
+def stream_gridfs_file(grid_file, first_chunk, chunk_size=64 * 1024):
+    try:
+        if first_chunk:
+            yield first_chunk
+        while True:
+            chunk = grid_file.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    except PyMongoError:
+        app.logger.exception("GridFS stream interrupted for %s", grid_file._id)
+        raise
+    finally:
+        grid_file.close()
+
+
+def migrate_legacy_assignment_files():
+    if database.using_in_memory_database or database.assignment_files is None:
+        return
+    legacy_root = os.path.realpath(os.path.join(os.path.dirname(__file__), "uploads", "assignments"))
+    migrations = (
+        (database.assignments, "ref_file_path", "ref_file_id", "ref_file_name", "teacher_id", "ref"),
+        (database.assignment_submissions, "file_path", "file_id", "file_name", "student_id", "submission"),
+    )
+    for collection, path_field, id_field, name_field, uploader_field, kind in migrations:
+        for document in collection.find({path_field: {"$exists": True, "$ne": None}, id_field: {"$exists": False}}):
+            legacy_value = document.get(path_field)
+            if not isinstance(legacy_value, str):
+                app.logger.warning("Skipping invalid legacy assignment file path for %s", document.get("assignment_id"))
+                continue
+            legacy_path = os.path.realpath(legacy_value)
+            try:
+                if os.path.commonpath((legacy_root, legacy_path)) != legacy_root or not os.path.isfile(legacy_path):
+                    app.logger.warning("Skipping invalid legacy assignment file path for %s", document.get("assignment_id"))
+                    continue
+            except ValueError:
+                app.logger.warning("Skipping invalid legacy assignment file path for %s", document.get("assignment_id"))
+                continue
+            filename = secure_filename(str(document.get(name_field) or os.path.basename(legacy_path)))
+            extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if not filename or extension not in ALLOWED_ASSIGNMENT_EXTENSIONS:
+                app.logger.warning("Skipping unsupported legacy assignment file %s", legacy_path)
+                continue
+            try:
+                size = os.path.getsize(legacy_path)
+                if size > MAX_ASSIGNMENT_FILE_SIZE:
+                    app.logger.warning("Skipping oversized legacy assignment file %s", legacy_path)
+                    continue
+                content_type = ASSIGNMENT_FILE_MIME_TYPES[extension]
+                uploaded_at = datetime.utcfromtimestamp(os.path.getmtime(legacy_path))
+                metadata = {
+                    "original_filename": filename,
+                    "content_type": content_type,
+                    "file_size": size,
+                    "uploader_id": document.get(uploader_field),
+                    "uploader_role": "teacher" if kind == "ref" else "student",
+                    "course_id": document.get("course_id"),
+                    "assignment_id": document.get("assignment_id"),
+                    "uploaded_at": uploaded_at,
+                }
+                with open(legacy_path, "rb") as legacy_file:
+                    file_id = store_gridfs_stream(legacy_file, filename, size, metadata)
+                update_result = collection.update_one(
+                    {"_id": document["_id"]},
+                    {"$set": {
+                        id_field: file_id,
+                        "file_content_type" if kind == "submission" else "ref_file_content_type": content_type,
+                        "file_size" if kind == "submission" else "ref_file_size": size,
+                        "file_uploaded_at" if kind == "submission" else "ref_file_uploaded_at": uploaded_at.isoformat(),
+                    }, "$unset": {path_field: ""}},
+                )
+                if not update_result.matched_count:
+                    delete_gridfs_file(file_id)
+                    raise RuntimeError("Legacy assignment record changed during file migration.")
+                os.remove(legacy_path)
+                app.logger.info("Migrated legacy assignment file %s to GridFS", legacy_path)
+            except Exception:
+                app.logger.exception("Failed to migrate legacy assignment file %s", legacy_path)
+
+
+migrate_legacy_assignment_files()
+
+
+@app.get("/api/assignments/files/<path:file_key>")
+def download_assignment_file(file_key):
     user = identity()
     if not user:
         return error("Authentication required to access files", 401)
-    
-    file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-    if not os.path.exists(file_path):
+    if database.assignment_files is None:
+        return error("MongoDB GridFS is unavailable", 503)
+
+    is_object_id = ObjectId.is_valid(file_key)
+    file_id = str(ObjectId(file_key)) if is_object_id else None
+    assignment = database.assignments.find_one({"ref_file_id": file_id}) if is_object_id else database.assignments.find_one({"ref_file_name": file_key})
+    submission = database.assignment_submissions.find_one({"file_id": file_id}) if is_object_id else database.assignment_submissions.find_one({"file_name": file_key})
+    if not assignment and not submission:
         return error("File not found", 404)
-        
-    as_attachment = request.args.get("download") == "1"
 
     role = user.get("role")
-    username = user.get("username")
-    student_id = user.get("student_id")
-    teacher_id = user.get("teacher_id")
-
-    # 1. Check reference file authorization
-    assignment = database.assignments.find_one({"ref_file_name": filename})
+    authorized = role == "admin"
     if assignment:
-        course_id = assignment["course_id"]
-        if role == "admin": authorized = True
-        elif role == "teacher":
-            authorized = bool(database.course_assignments.find_one({"course_id": course_id, "teacher_id": teacher_id, "status": "active"}))
+        course_id = assignment.get("course_id")
+        if role == "teacher":
+            assigned = database.course_assignments.find_one({"course_id": course_id, "teacher_id": user.get("teacher_id"), "status": "active"})
+            course = database.courses.find_one({"course_id": course_id}) or {}
+            authorized = bool(assigned or course.get("teacher_id") == user.get("teacher_id"))
         elif role == "student":
-            authorized = bool(database.enrollments.find_one({"course_id": course_id, "student_id": student_id}) or database.enrollments.find_one({"course_id": course_id, "roll": username}))
-        else: authorized = False
-        if not authorized: return error("Unauthorized to access this reference file", 403)
-        return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=as_attachment)
-
-    # 2. Check student submission file authorization
-    submission = database.assignment_submissions.find_one({"file_name": filename})
-    if submission:
-        course_id = submission["course_id"]
-        if role == "admin": authorized = True
-        elif role == "teacher":
-            authorized = bool(database.course_assignments.find_one({"course_id": course_id, "teacher_id": teacher_id, "status": "active"}))
+            authorized = bool(
+                database.enrollments.find_one({"course_id": course_id, "student_id": user.get("student_id")})
+                or database.enrollments.find_one({"course_id": course_id, "roll": user.get("username")})
+            )
+    elif submission:
+        course_id = submission.get("course_id")
+        if role == "teacher":
+            assigned = database.course_assignments.find_one({"course_id": course_id, "teacher_id": user.get("teacher_id"), "status": "active"})
+            course = database.courses.find_one({"course_id": course_id}) or {}
+            authorized = bool(assigned or course.get("teacher_id") == user.get("teacher_id"))
         elif role == "student":
-            authorized = (submission.get("student_id") == student_id or submission.get("roll") == username or submission.get("student_id") == username)
-        else: authorized = False
-        if not authorized: return error("Unauthorized to access this submission file", 403)
-        return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=as_attachment)
+            authorized = bool(
+                submission.get("student_id") in (user.get("student_id"), user.get("username"))
+                or submission.get("roll") == user.get("username")
+            )
+    if not authorized:
+        return error("Unauthorized to access this file", 403)
 
-    if role in ("admin", "teacher", "student"):
-        return send_from_directory(app.config["UPLOAD_FOLDER"], filename, as_attachment=as_attachment)
+    stored_id = (assignment or submission).get("ref_file_id" if assignment else "file_id")
+    if not ObjectId.is_valid(str(stored_id or "")):
+        return error("File is not stored in GridFS", 404)
+    try:
+        grid_file, first_chunk = open_gridfs_file(ObjectId(str(stored_id)))
+    except NoFile:
+        return error("File not found", 404)
+    except PyMongoError:
+        app.logger.exception("GridFS file retrieval failed for %s", stored_id)
+        return error("File storage is temporarily unavailable. Please try again.", 503)
 
-    return error("File metadata not found", 404)
+    metadata = grid_file.metadata or {}
+    filename = metadata.get("original_filename") or grid_file.filename
+    content_type = metadata.get("content_type") or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    inline_types = {"application/pdf", "text/plain", "image/jpeg", "image/png"}
+    as_attachment = request.args.get("download") == "1" or content_type not in inline_types
+    response = Response(
+        stream_with_context(stream_gridfs_file(grid_file, first_chunk)),
+        mimetype=content_type,
+    )
+    response.headers.set("Content-Disposition", "attachment" if as_attachment else "inline", filename=filename)
+    response.headers["Content-Length"] = str(grid_file.length)
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 def require_role(required_role):
     """Authorize only the role encoded in the signed login token."""
@@ -350,7 +608,9 @@ def student_assignments(course_code):
                 "submission_status": "Graded" if submission.get("marks") is not None else submission.get("status", "Submitted").title(),
                 "submitted_at": submission.get("submitted_at"),
                 "text_answer": submission.get("text_answer"),
+                "file_id": submission.get("file_id"),
                 "file_name": submission.get("file_name"),
+                "file_content_type": submission.get("file_content_type"),
                 "marks": submission.get("marks"),
                 "feedback": submission.get("feedback")
             })
@@ -371,31 +631,23 @@ def submit_student_assignment(course_code, assignment_id):
     if date.today() > deadline: return error("Assignment submission deadline has passed.", 400)
     text_answer = request.form.get("text_answer", "").strip() if request.form else (request.get_json(silent=True) or {}).get("text_answer", "").strip()
     upload = request.files.get("file") or request.files.get("submission_file")
-    file_name = None
-    file_path = None
-    if upload and upload.filename:
-        extension = upload.filename.rsplit(".", 1)[-1].lower() if "." in upload.filename else ""
-        if extension not in ALLOWED_ASSIGNMENT_EXTENSIONS:
-            return error(f"Unsupported file type. Allowed: {', '.join(sorted(ALLOWED_ASSIGNMENT_EXTENSIONS))}")
-        upload.seek(0, os.SEEK_END)
-        size = upload.tell()
-        upload.seek(0)
-        if size > 10 * 1024 * 1024:
-            return error("File size exceeds 10 MB limit.", 400)
-        s_name = secure_filename(upload.filename)
-        stored_name = f"sub_{uuid4()}_{s_name}"
-        os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-        full_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
-        upload.save(full_path)
-        file_name = stored_name
-        file_path = full_path
-
     existing = database.assignment_submissions.find_one({"assignment_id": assignment_id, "student_id": student["student_id"]})
-    if not file_name and not (existing or {}).get("file_name"):
+    stored_file = None
+    if upload and upload.filename:
+        try:
+            stored_file = store_assignment_upload(
+                upload,
+                student["student_id"],
+                "student",
+                course["course_id"],
+                assignment_id,
+            )
+        except FileValidationError as exc:
+            return error(str(exc), 400)
+        except FileStorageUnavailable as exc:
+            return error(str(exc), 503)
+    if not stored_file and not (existing or {}).get("file_id"):
         return error("Please select an assignment file to upload.", 400)
-    if file_name and existing and existing.get("file_path") and os.path.exists(existing["file_path"]):
-        try: os.remove(existing["file_path"])
-        except OSError: pass
     row = {
         "assignment_id": assignment_id,
         "course_id": course["course_id"],
@@ -404,14 +656,31 @@ def submit_student_assignment(course_code, assignment_id):
         "roll": student.get("roll", student["student_id"]),
         "submitted_at": datetime.utcnow().isoformat(),
         "text_answer": "",
-        "file_name": file_name or (existing or {}).get("file_name"),
-        "file_path": file_path or (existing or {}).get("file_path"),
+        "file_id": (stored_file or existing).get("file_id"),
+        "file_name": (stored_file or existing).get("file_name"),
+        "file_content_type": (stored_file or existing).get("file_content_type"),
+        "file_size": (stored_file or existing).get("file_size"),
+        "file_uploaded_at": (stored_file or existing).get("file_uploaded_at"),
         "status": "Submitted",
         "marks": existing.get("marks") if existing else None,
         "total_marks": assignment["total_marks"],
         "feedback": existing.get("feedback") if existing else None
     }
-    database.assignment_submissions.update_one({"assignment_id": assignment_id, "student_id": student["student_id"]}, {"$set": row}, upsert=True)
+    try:
+        database.assignment_submissions.update_one(
+            {"assignment_id": assignment_id, "student_id": student["student_id"]},
+            {"$set": row, "$unset": {"file_path": ""}},
+            upsert=True,
+        )
+    except Exception:
+        if stored_file:
+            try:
+                delete_gridfs_file(stored_file["file_id"])
+            except Exception:
+                app.logger.exception("Failed to clean up an unreferenced GridFS submission")
+        raise
+    if stored_file and existing and existing.get("file_id") and existing["file_id"] != stored_file["file_id"]:
+        delete_gridfs_file(existing["file_id"])
     return jsonify({"message": "Assignment submitted successfully.", "status": row["status"]})
 
 
@@ -424,10 +693,10 @@ def unsubmit_student_assignment(course_code, assignment_id):
     if not existing: return error("Submission not found", 404)
     if existing.get("status") == "Graded" or existing.get("marks") is not None:
         return error("Graded assignments cannot be unsubmitted.", 400)
-    file_path = existing.get("file_path")
-    if file_path and os.path.exists(file_path):
-        try: os.remove(file_path)
-        except OSError: pass
+    try:
+        delete_gridfs_file(existing.get("file_id"))
+    except FileStorageUnavailable as exc:
+        return error(str(exc), 503)
     database.assignment_submissions.delete_one({"assignment_id": assignment_id, "student_id": student["student_id"]})
     return jsonify({"message": "Assignment unsubmitted successfully."})
 
@@ -864,7 +1133,9 @@ def assignments(course_code):
                     "status": status,
                     "submitted_at": sub.get("submitted_at") if sub else None,
                     "text_answer": sub.get("text_answer") if sub else None,
+                    "file_id": sub.get("file_id") if sub else None,
                     "file_name": sub.get("file_name") if sub else None,
+                    "file_content_type": sub.get("file_content_type") if sub else None,
                     "marks": sub.get("marks") if sub else None,
                     "total_marks": total_m,
                     "feedback": sub.get("feedback") if sub else None
@@ -920,29 +1191,22 @@ def assignments(course_code):
 
     # Handle Reference / Instructions File Upload
     ref_upload = request.files.get("ref_file") or request.files.get("file")
-    ref_file_name = None
-    ref_file_path = None
-    if ref_upload and ref_upload.filename:
-        ext = ref_upload.filename.rsplit(".", 1)[-1].lower() if "." in ref_upload.filename else ""
-        if ext not in ALLOWED_ASSIGNMENT_EXTENSIONS:
-            return error(f"Unsupported reference file type. Allowed: {', '.join(sorted(ALLOWED_ASSIGNMENT_EXTENSIONS))}")
-        
-        ref_upload.seek(0, os.SEEK_END)
-        size = ref_upload.tell()
-        ref_upload.seek(0)
-        if size > 10 * 1024 * 1024:
-            return error("Reference file exceeds maximum size of 10 MB", 400)
-
-        s_name = secure_filename(ref_upload.filename)
-        stored_name = f"ref_{uuid4()}_{s_name}"
-        os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-        full_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
-        ref_upload.save(full_path)
-        ref_file_name = stored_name
-        ref_file_path = full_path
-
     assignment_id = f"{course['course_id']}-A{number}"
     existing_doc = database.assignments.find_one({"assignment_id": assignment_id}) or {}
+    stored_file = None
+    if ref_upload and ref_upload.filename:
+        try:
+            stored_file = store_assignment_upload(
+                ref_upload,
+                request.teacher_id,
+                "teacher",
+                course["course_id"],
+                assignment_id,
+            )
+        except FileValidationError as exc:
+            return error(str(exc), 400)
+        except FileStorageUnavailable as exc:
+            return error(str(exc), 503)
 
     doc = {
         "assignment_id": assignment_id,
@@ -956,12 +1220,29 @@ def assignments(course_code):
         "description": description,
         "deadline": deadline,
         "total_marks": total_marks,
-        "ref_file_name": ref_file_name or existing_doc.get("ref_file_name"),
-        "ref_file_path": ref_file_path or existing_doc.get("ref_file_path"),
+        "ref_file_id": (stored_file or existing_doc).get("file_id", existing_doc.get("ref_file_id")),
+        "ref_file_name": (stored_file or existing_doc).get("file_name") if stored_file or existing_doc.get("ref_file_id") else None,
+        "ref_file_content_type": (stored_file or existing_doc).get("file_content_type", existing_doc.get("ref_file_content_type")),
+        "ref_file_size": (stored_file or existing_doc).get("file_size", existing_doc.get("ref_file_size")),
+        "ref_file_uploaded_at": (stored_file or existing_doc).get("file_uploaded_at", existing_doc.get("ref_file_uploaded_at")),
         "status": "active"
     }
 
-    database.assignments.update_one({"assignment_id": assignment_id}, {"$set": doc}, upsert=True)
+    try:
+        database.assignments.update_one(
+            {"assignment_id": assignment_id},
+            {"$set": doc, "$unset": {"ref_file_path": ""}},
+            upsert=True,
+        )
+    except Exception:
+        if stored_file:
+            try:
+                delete_gridfs_file(stored_file["file_id"])
+            except Exception:
+                app.logger.exception("Failed to clean up an unreferenced GridFS reference file")
+        raise
+    if stored_file and existing_doc.get("ref_file_id") and existing_doc["ref_file_id"] != stored_file["file_id"]:
+        delete_gridfs_file(existing_doc["ref_file_id"])
     return jsonify({"message": "Assignment created/updated successfully.", "assignment": public(doc)}), 201
 
 @app.post("/api/teacher/courses/<path:course_code>/assignments/<assignment_id>/submissions/<roll>/grade")
@@ -1001,7 +1282,6 @@ def grade_assignment(course_code, assignment_id, roll):
             "submitted_at": datetime.utcnow().isoformat(),
             "text_answer": "",
             "file_name": None,
-            "file_path": None,
             "status": "Submitted"
         }
 
@@ -1029,13 +1309,22 @@ def unsubmit_teacher_assignment_file(course_code, assignment_id):
     if response: return response
     assignment = database.assignments.find_one({"assignment_id": assignment_id, "course_id": course["course_id"]})
     if not assignment: return error("Assignment not found", 404)
-    file_path = assignment.get("ref_file_path")
-    if file_path and os.path.exists(file_path):
-        try: os.remove(file_path)
-        except OSError: pass
+    try:
+        delete_gridfs_file(assignment.get("ref_file_id"))
+    except FileStorageUnavailable as exc:
+        return error(str(exc), 503)
     database.assignments.update_one(
         {"assignment_id": assignment_id, "course_id": course["course_id"]},
-        {"$set": {"ref_file_name": None, "ref_file_path": None}}
+        {
+            "$set": {
+                "ref_file_id": None,
+                "ref_file_name": None,
+                "ref_file_content_type": None,
+                "ref_file_size": None,
+                "ref_file_uploaded_at": None,
+            },
+            "$unset": {"ref_file_path": ""},
+        },
     )
     return jsonify({"message": "Assignment file unsubmitted successfully."})
 
@@ -1050,28 +1339,41 @@ def upload_teacher_assignment_file(course_code, assignment_id):
     ref_upload = request.files.get("ref_file") or request.files.get("file")
     if not ref_upload or not ref_upload.filename:
         return error("Please select a file to upload.", 400)
-    ext = ref_upload.filename.rsplit(".", 1)[-1].lower() if "." in ref_upload.filename else ""
-    if ext not in ALLOWED_ASSIGNMENT_EXTENSIONS:
-        return error(f"Unsupported reference file type. Allowed: {', '.join(sorted(ALLOWED_ASSIGNMENT_EXTENSIONS))}")
-    ref_upload.seek(0, os.SEEK_END)
-    size = ref_upload.tell()
-    ref_upload.seek(0)
-    if size > 10 * 1024 * 1024:
-        return error("File exceeds maximum size of 10 MB", 400)
-    old_file_path = assignment.get("ref_file_path")
-    if old_file_path and os.path.exists(old_file_path):
-        try: os.remove(old_file_path)
-        except OSError: pass
-    s_name = secure_filename(ref_upload.filename)
-    stored_name = f"ref_{uuid4()}_{s_name}"
-    os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-    full_path = os.path.join(app.config["UPLOAD_FOLDER"], stored_name)
-    ref_upload.save(full_path)
-    database.assignments.update_one(
-        {"assignment_id": assignment_id, "course_id": course["course_id"]},
-        {"$set": {"ref_file_name": stored_name, "ref_file_path": full_path}}
-    )
-    return jsonify({"message": "Assignment file updated successfully.", "ref_file_name": stored_name})
+    try:
+        stored_file = store_assignment_upload(
+            ref_upload,
+            request.teacher_id,
+            "teacher",
+            course["course_id"],
+            assignment_id,
+        )
+    except FileValidationError as exc:
+        return error(str(exc), 400)
+    except FileStorageUnavailable as exc:
+        return error(str(exc), 503)
+    try:
+        database.assignments.update_one(
+            {"assignment_id": assignment_id, "course_id": course["course_id"]},
+            {
+                "$set": {
+                    "ref_file_id": stored_file["file_id"],
+                    "ref_file_name": stored_file["file_name"],
+                    "ref_file_content_type": stored_file["file_content_type"],
+                    "ref_file_size": stored_file["file_size"],
+                    "ref_file_uploaded_at": stored_file["file_uploaded_at"],
+                },
+                "$unset": {"ref_file_path": ""},
+            },
+        )
+    except Exception:
+        try:
+            delete_gridfs_file(stored_file["file_id"])
+        except Exception:
+            app.logger.exception("Failed to clean up an unreferenced GridFS reference file")
+        raise
+    if assignment.get("ref_file_id") and assignment["ref_file_id"] != stored_file["file_id"]:
+        delete_gridfs_file(assignment["ref_file_id"])
+    return jsonify({"message": "Assignment file updated successfully.", "ref_file_id": stored_file["file_id"], "ref_file_name": stored_file["file_name"]})
 
 
 @app.route("/api/teacher/courses/<path:course_code>/assignments/<assignment_id>/submissions/<roll>/unsubmit", methods=["POST", "DELETE"])
@@ -1083,11 +1385,17 @@ def teacher_unsubmit_student_submission(course_code, assignment_id, roll):
           database.assignment_submissions.find_one({"assignment_id": assignment_id, "course_id": course["course_id"], "student_id": roll})
     if not sub:
         return error("Submission not found", 404)
-    file_path = sub.get("file_path")
-    if file_path and os.path.exists(file_path):
-        try: os.remove(file_path)
-        except OSError: pass
-    database.assignment_submissions.delete_one({"_id": sub["_id"]})
+    try:
+        delete_gridfs_file(sub.get("file_id"))
+    except FileStorageUnavailable as exc:
+        return error(str(exc), 503)
+    query = {"_id": sub["_id"]} if "_id" in sub else {
+        "assignment_id": assignment_id,
+        "course_id": course["course_id"],
+        "student_id": sub.get("student_id"),
+        "roll": sub.get("roll"),
+    }
+    database.assignment_submissions.delete_one(query)
     return jsonify({"message": f"Submission for Roll {roll} has been unsubmitted successfully."})
 
 
